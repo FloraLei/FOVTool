@@ -1,0 +1,22 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Temp / log files
+crash_log.txt
+err.txt
+
+# Test output images
+sample_output*.png
+
+# Editor / OS
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
