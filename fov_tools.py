@@ -1182,10 +1182,11 @@ class Canvas3D(QWidget):
         # Persistent view angles (preserved across redraws / user drag)
         self._elev = 25.0
         self._azim = -55.0
+        self._hidden_in_3d: set = set()   # sensor IDs hidden only in 3D view
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
         # ── Viewpoint preset toolbar ──────────────────────────
         vp_bar = QWidget()
@@ -1194,38 +1195,98 @@ class Canvas3D(QWidget):
         vp_lay.setContentsMargins(8, 3, 8, 3)
         vp_lay.setSpacing(4)
         lbl_vp = QLabel("视角预设:")
-        lbl_vp.setStyleSheet("color:#AAAAAA; font-size:11px;")
+        lbl_vp.setStyleSheet("color:#AAAAAA; font-size:12px;")
         vp_lay.addWidget(lbl_vp)
 
-        presets = [
-            ("🔭 等距", 25, -55, "三维等距视角（默认）"),
-            ("⬆  俯视", 89, -90, "正上方俯视（XY平面）"),
-            ("◀  正视", 0,  90,  "从车头正前方看（YZ平面）"),
-            ("↙  侧视", 0,   0,  "从车辆右侧看（XZ平面）"),
-            ("↗  后视", 0, -90,  "从车尾向前看"),
+        self._vp_presets = [
+            ("🔭 等距", 25.0, -55.0, "三维等距视角（再次点击翻转180°）"),
+            ("⬆  俯视", 89.0, -90.0, "正上方俯视（再次点击翻转）"),
+            ("◀  正视", 0.0,  90.0,  "从车头正前方看（再次点击→后视）"),
+            ("↙  侧视", 0.0,   0.0,  "从车辆右侧看（再次点击→左侧视）"),
         ]
-        for lbl, e, a, tip in presets:
+        self._vp_buttons: list[QPushButton] = []
+        _vp_btn_style = (
+            "QPushButton{{background:{bg};border:1px solid {bd};"
+            "border-radius:3px;padding:0 8px;font-size:12px;font-weight:bold;}}"
+            "QPushButton:hover{{background:#505050;}}"
+        )
+        for idx, (lbl, e, a, tip) in enumerate(self._vp_presets):
             b = QPushButton(lbl)
             b.setToolTip(tip)
-            b.setFixedHeight(24)
-            b.setStyleSheet(
-                "QPushButton{background:#3A3A3A;border:1px solid #555;"
-                "border-radius:3px;padding:0 6px;font-size:11px;}"
-                "QPushButton:hover{background:#505050;}"
-                "QPushButton:pressed{background:#606060;}"
-            )
-            b.clicked.connect(lambda _, ev=e, az=a: self._set_view(ev, az))
+            b.setFixedHeight(26)
+            b.setStyleSheet(_vp_btn_style.format(bg="#3A3A3A", bd="#555"))
+            b.clicked.connect(lambda _, i=idx: self._set_view_preset(i))
             vp_lay.addWidget(b)
+            self._vp_buttons.append(b)
+        self._active_preset_idx = -1   # which preset is currently active
 
         vp_lay.addStretch()
-        layout.addWidget(vp_bar)
+        main_layout.addWidget(vp_bar)
+
+        # ── Splitter: figure (left) + sensor visibility (right) ──
+        splitter = QSplitter(Qt.Horizontal)
+
+        fig_widget = QWidget()
+        fig_layout = QVBoxLayout(fig_widget)
+        fig_layout.setContentsMargins(0, 0, 0, 0)
+        fig_layout.setSpacing(0)
 
         self.fig = Figure(facecolor="#1E1E1E")
         self.canvas = FigureCanvas(self.fig)
         self._nav = NavToolbar(self.canvas, self)
         self._nav.setStyleSheet("background:#2B2B2B; color:#DDDDDD;")
-        layout.addWidget(self._nav)
-        layout.addWidget(self.canvas, stretch=1)
+        fig_layout.addWidget(self._nav)
+        fig_layout.addWidget(self.canvas, stretch=1)
+        splitter.addWidget(fig_widget)
+
+        # ── Sensor visibility panel ───────────────────────────
+        vis_panel = QWidget()
+        vis_panel.setStyleSheet("background:#1E1E1E;")
+        vis_panel.setMinimumWidth(150)
+        vis_panel.setMaximumWidth(200)
+        vis_layout = QVBoxLayout(vis_panel)
+        vis_layout.setContentsMargins(6, 6, 6, 6)
+        vis_layout.setSpacing(6)
+
+        vis_title = QLabel("传感器显示")
+        vis_title.setStyleSheet(
+            "color:#DDDDDD; font-weight:bold; font-size:13px;"
+            "border-bottom:1px solid #444; padding-bottom:4px;")
+        vis_layout.addWidget(vis_title)
+
+        self._vis_list = QListWidget()
+        self._vis_list.setStyleSheet(
+            "QListWidget{background:#2B2B2B; color:#DDDDDD; font-size:12px;"
+            "border:1px solid #444; border-radius:3px;}"
+            "QListWidget::item{padding:3px 2px;}"
+            "QListWidget::item:selected{background:#3A3A3A;}"
+        )
+        self._vis_list.itemChanged.connect(self._on_vis_changed)
+        vis_layout.addWidget(self._vis_list, stretch=1)
+
+        btn_all = QPushButton("全部显示")
+        btn_all.setFixedHeight(26)
+        btn_all.setStyleSheet(
+            "QPushButton{background:#3A3A3A;border:1px solid #555;"
+            "border-radius:3px;font-size:12px;color:#DDDDDD;}"
+            "QPushButton:hover{background:#505050;}")
+        btn_all.clicked.connect(self._show_all_sensors)
+        vis_layout.addWidget(btn_all)
+
+        btn_none = QPushButton("全部隐藏")
+        btn_none.setFixedHeight(26)
+        btn_none.setStyleSheet(
+            "QPushButton{background:#3A3A3A;border:1px solid #555;"
+            "border-radius:3px;font-size:12px;color:#DDDDDD;}"
+            "QPushButton:hover{background:#505050;}")
+        btn_none.clicked.connect(self._hide_all_sensors)
+        vis_layout.addWidget(btn_none)
+
+        splitter.addWidget(vis_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+
+        main_layout.addWidget(splitter, stretch=1)
 
         self.ax = self.fig.add_subplot(111, projection='3d')
         self.ax.set_facecolor("#1E1E1E")
@@ -1233,21 +1294,86 @@ class Canvas3D(QWidget):
 
         signals.sensor_changed.connect(self._delayed_redraw)
         signals.sensor_moved.connect(self._delayed_redraw)
-        signals.sensor_added.connect(self._delayed_redraw)
-        signals.sensor_removed.connect(self._delayed_redraw)
+        signals.sensor_added.connect(self._on_scene_rebuilt)
+        signals.sensor_removed.connect(self._on_scene_rebuilt)
         signals.vehicle_changed.connect(self._delayed_redraw)
-        signals.scene_rebuilt.connect(self._delayed_redraw)
+        signals.scene_rebuilt.connect(self._on_scene_rebuilt)
 
         self._timer = QTimer()
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.redraw)
         self._timer.start(200)
+        QTimer.singleShot(100, self._rebuild_vis_list)
+
+    # ── visibility panel helpers ──────────────────────────────
+    def _rebuild_vis_list(self):
+        self._vis_list.blockSignals(True)
+        self._vis_list.clear()
+        for s in self.scene_cfg.sensors:
+            item = QListWidgetItem(s.name)
+            item.setData(Qt.UserRole, s.id)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked if s.id in self._hidden_in_3d
+                               else Qt.Checked)
+            item.setForeground(QColor(s.color))
+            self._vis_list.addItem(item)
+        self._vis_list.blockSignals(False)
+
+    def _on_vis_changed(self, item: QListWidgetItem):
+        sid = item.data(Qt.UserRole)
+        if item.checkState() == Qt.Checked:
+            self._hidden_in_3d.discard(sid)
+        else:
+            self._hidden_in_3d.add(sid)
+        self._delayed_redraw()
+
+    def _show_all_sensors(self):
+        self._hidden_in_3d.clear()
+        self._rebuild_vis_list()
+        self._delayed_redraw()
+
+    def _hide_all_sensors(self):
+        self._hidden_in_3d = {s.id for s in self.scene_cfg.sensors}
+        self._rebuild_vis_list()
+        self._delayed_redraw()
+
+    def _on_scene_rebuilt(self, *_):
+        # Clean up IDs that no longer exist
+        current_ids = {s.id for s in self.scene_cfg.sensors}
+        self._hidden_in_3d &= current_ids
+        self._rebuild_vis_list()
+        self._delayed_redraw()
 
     def _delayed_redraw(self, *_):
         self._timer.start(300)
 
+    # ── viewpoint preset with flip ────────────────────────────
+    _VP_BTN_NORMAL  = ("QPushButton{background:#3A3A3A;border:1px solid #555;"
+                        "border-radius:3px;padding:0 8px;font-size:12px;font-weight:bold;}"
+                        "QPushButton:hover{background:#505050;}")
+    _VP_BTN_ACTIVE  = ("QPushButton{background:#4A90D9;border:1px solid #3A7BC8;"
+                        "border-radius:3px;padding:0 8px;font-size:12px;font-weight:bold;}"
+                        "QPushButton:hover{background:#5AA0E9;}")
+
+    def _set_view_preset(self, idx: int):
+        _, elev, azim, _ = self._vp_presets[idx]
+        # Same preset clicked again → flip azimuth 180°
+        if idx == self._active_preset_idx:
+            azim = azim + 180.0
+        self._active_preset_idx = idx
+        # Update button styles
+        for i, b in enumerate(self._vp_buttons):
+            b.setStyleSheet(self._VP_BTN_ACTIVE if i == idx else self._VP_BTN_NORMAL)
+        self._elev = float(elev)
+        self._azim = float(azim)
+        self.ax.view_init(elev=self._elev, azim=self._azim)
+        self.canvas.draw()
+
     def _set_view(self, elev: float, azim: float):
-        """Apply a preset view angle immediately (no full redraw)."""
+        """Direct angle set (used by old callers; clears active preset highlight)."""
+        self._active_preset_idx = -1
+        for b in self._vp_buttons:
+            b.setStyleSheet(self._VP_BTN_NORMAL)
         self._elev = elev
         self._azim = azim
         self.ax.view_init(elev=elev, azim=azim)
@@ -1261,7 +1387,7 @@ class Canvas3D(QWidget):
             self.ax.cla()
             self.ax.text2D(0.5, 0.5, f'3D\u89c6\u56fe\u9519\u8bef:\n{traceback.format_exc()}',
                            transform=self.ax.transAxes, ha='center', va='center',
-                           color='red', fontsize=7, family='monospace')
+                           color='red', fontsize=9, family='monospace')
             self.canvas.draw()
 
     def _redraw_impl(self):
@@ -1275,15 +1401,15 @@ class Canvas3D(QWidget):
         ax = self.ax
 
         ax.set_facecolor("#1E1E1E")
-        ax.tick_params(colors='#888888', labelsize=7)
+        ax.tick_params(colors='#AAAAAA', labelsize=11)
         for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
             pane.fill = False
             pane.set_edgecolor('#444444')
         ax.grid(True, color='#333333', linewidth=0.4)
-        ax.set_xlabel("X (m)",  color='#888888', fontsize=8)
-        ax.set_ylabel("Y (m)",  color='#888888', fontsize=8)
-        ax.set_zlabel("Z (m)", color='#888888', fontsize=8)
-        ax.set_title("3D FOV 视图", color='#CCCCCC', fontsize=9, pad=4)
+        ax.set_xlabel("X (m)",  color='#AAAAAA', fontsize=12)
+        ax.set_ylabel("Y (m)",  color='#AAAAAA', fontsize=12)
+        ax.set_zlabel("Z (m)", color='#AAAAAA', fontsize=12)
+        ax.set_title("3D FOV 视图", color='#DDDDDD', fontsize=13, pad=6)
 
         # ── Vehicle box ──────────────────────────────────────
         v   = self.scene_cfg.vehicle
@@ -1326,6 +1452,8 @@ class Canvas3D(QWidget):
         for sensor in self.scene_cfg.sensors:
             if not sensor.enabled:
                 continue
+            if sensor.id in self._hidden_in_3d:
+                continue
             faces = fov_cone_faces(sensor)
             if not faces:
                 continue
@@ -1343,7 +1471,10 @@ class Canvas3D(QWidget):
             ax.scatter([sensor.x], [sensor.y], [sensor.z],
                        color=sensor.color, s=30, zorder=5)
             ax.text(sensor.x, sensor.y, sensor.z + 0.3,
-                    sensor.name, color=sensor.color, fontsize=6)
+                    sensor.name, color='#FFFFFF', fontsize=8,
+                    fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.15',
+                              fc='#00000088', ec='none'))
 
         # ── Auto-scale axes ───────────────────────────────────
         pts = np.array(all_pts)
@@ -2667,10 +2798,12 @@ class CanvasSideView(QWidget):
                         color=s.color, linewidth=3, alpha=0.65, zorder=7)
 
             ax.annotate(
-                s.name, xy=(s.y, s.z + 0.3),
-                color=s.color, fontsize=6, ha='center', zorder=10,
-                bbox=dict(boxstyle='round,pad=0.2', fc='#1E1E1E22',
-                          ec='none', alpha=0.8)
+                s.name, xy=(s.y, s.z + 0.35),
+                color='#000000', fontsize=10, fontweight='bold',
+                ha='center', va='bottom', zorder=15,
+                bbox=dict(boxstyle='round,pad=0.25',
+                          fc='white', ec=s.color,
+                          linewidth=1.4, alpha=0.92)
             )
 
         # ── Legend & axes ─────────────────────────────────────
