@@ -11,11 +11,19 @@ Usage:
 """
 
 import sys
+import os
+import warnings
+warnings.simplefilter("ignore")
+
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 import json
 import math
 import uuid
 import copy
-import os
 import re
 import subprocess
 import tempfile
