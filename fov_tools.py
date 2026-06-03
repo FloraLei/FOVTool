@@ -273,6 +273,50 @@ class SensorConfig:
 
 
 @dataclass
+class LaneParamConfig:
+    """参数化车道线配置"""
+    lane_width:     float = 3.75       # 中心线到中心线宽度 (m)
+    line_width:     float = 0.15       # 车道线自身宽度 (m)
+    lateral_offset: float = 0.0        # 相对车辆Y0的偏移 (m)
+    curvature_r:    float = 0.0        # 弯道半径 R (m, 0=直)
+    left_lines:     int   = 1          # 左侧车道线数量
+    right_lines:    int   = 1          # 右侧车道线数量
+    length:         float = 100.0      # 车道线长度 (m)
+    color_outer:    str   = "#FFFFFF"  # 外侧边界线颜色 (默认白色)
+    color_inner:    str   = "#FFCC00"  # 内侧分界线/中心虚线颜色 (默认黄色)
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        valid = {f.name for f in dc_fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in valid})
+
+
+@dataclass
+class TargetVehicleConfig:
+    """目标车辆配置"""
+    id:      str   = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    name:    str   = "Target"
+    x:       float = 0.0        # 横向坐标 (X, meters)
+    y:       float = 20.0       # 纵向坐标 (Y, meters, 车前为正)
+    heading: float = 0.0        # 航向角 (degrees, 0 = 同向朝前)
+    length:  float = 4.8        # 车长 (meters)
+    width:   float = 2.0        # 车宽 (meters)
+    color:   str   = "#FF5252"   # 车辆填充颜色 (默认红色)
+    enabled: bool  = True
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        valid = {f.name for f in dc_fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in valid})
+
+
+@dataclass
 class VehicleConfig:
     length: float = 4.8        # 车头(牵引车)长度
     width:  float = 2.0        # 车头(牵引车)宽度
@@ -303,16 +347,20 @@ class VehicleConfig:
 
 @dataclass
 class SceneConfig:
-    vehicle:      VehicleConfig      = field(default_factory=VehicleConfig)
-    sensors:      List[SensorConfig] = field(default_factory=list)
-    show_grid:    bool               = True
-    show_labels:  bool               = False
-    show_overlap: bool               = False
+    vehicle:         VehicleConfig              = field(default_factory=VehicleConfig)
+    sensors:         List[SensorConfig]        = field(default_factory=list)
+    lane_params:     LaneParamConfig            = field(default_factory=LaneParamConfig)
+    target_vehicles: List[TargetVehicleConfig]  = field(default_factory=list)
+    show_grid:       bool                       = True
+    show_labels:     bool                       = False
+    show_overlap:    bool                       = False
 
     def to_dict(self):
         return dict(
             vehicle=self.vehicle.to_dict(),
             sensors=[s.to_dict() for s in self.sensors],
+            lane_params=self.lane_params.to_dict(),
+            target_vehicles=[tv.to_dict() for tv in self.target_vehicles],
             show_grid=self.show_grid,
             show_labels=self.show_labels,
             show_overlap=self.show_overlap,
@@ -320,9 +368,17 @@ class SceneConfig:
 
     @classmethod
     def from_dict(cls, d: dict):
+        lp_dict = d.get("lane_params", {})
+        if not lp_dict and "lane_lines" in d:
+            lp = LaneParamConfig()
+        else:
+            lp = LaneParamConfig.from_dict(lp_dict)
+
         return cls(
             vehicle=VehicleConfig.from_dict(d.get("vehicle", {})),
             sensors=[SensorConfig.from_dict(s) for s in d.get("sensors", [])],
+            lane_params=lp,
+            target_vehicles=[TargetVehicleConfig.from_dict(tv) for tv in d.get("target_vehicles", [])],
             show_grid=d.get("show_grid", True),
             show_labels=d.get("show_labels", True),
             show_overlap=d.get("show_overlap", False),
@@ -436,6 +492,11 @@ class AppSignals(QObject):
     sensor_removed   = pyqtSignal(str)
     vehicle_changed  = pyqtSignal()
     scene_rebuilt    = pyqtSignal()      # full rebuild needed
+    lane_changed            = pyqtSignal()      # lane parameter edit
+    target_vehicle_added    = pyqtSignal(str)   # target vehicle id
+    target_vehicle_removed  = pyqtSignal(str)   # target vehicle id
+    target_vehicle_changed  = pyqtSignal(str)   # target vehicle id - property edit
+    target_vehicle_selected = pyqtSignal(str)   # target vehicle id
 
 
 # ══════════════════════════════════════════════════════════════
@@ -696,21 +757,32 @@ class GridItem(QGraphicsItem):
 
         # Axis distance labels — adaptive step so labels never overlap
         if lv > 0.002:
-            font = QFont("Arial", 7)
+            font = QFont("Arial", 8)
             font.setStyleHint(QFont.Monospace)
             painter.setFont(font)
             painter.setPen(QColor(label_c))
-            MIN_PX = 36
+            
             fm_step = self.MAJOR
-            for candidate in [50, 100, 200, 500, 1000]:
-                if lv * candidate >= MIN_PX:
+            for candidate in [10, 20, 50, 100, 200, 500, 1000]:
+                if lv * candidate >= 65:
                     fm_step = candidate
                     break
+            
+            orig_transform = painter.worldTransform()
+            painter.setWorldTransform(QTransform())
+            
             for v in range(-e, e+1, fm_step):
                 if v == 0:
                     continue
-                painter.drawText(QPointF(float(v) + 0.5, float(fm_step) * 0.04), f"{v}m")
-                painter.drawText(QPointF(float(fm_step) * 0.02, float(-v) + 0.5), f"{v}m")
+                # Horizontal labels along X-axis
+                pt_h = orig_transform.map(QPointF(float(v), 0.0))
+                painter.drawText(pt_h + QPointF(-12, 13), f"{v}m")
+                
+                # Vertical labels along Y-axis
+                pt_v = orig_transform.map(QPointF(0.0, float(-v)))
+                painter.drawText(pt_v + QPointF(5, 5), f"{v}m")
+                
+            painter.setWorldTransform(orig_transform)
 
         # Axes
         axis_pen = QPen(QColor(axis_c), 0)
@@ -761,6 +833,160 @@ class ScaleBarItem(QGraphicsItem):
         painter.drawText(QRectF(0, 20, bar_px, 18), Qt.AlignCenter, f"{bar_m:.4g} m")
 
 
+class LanesItem(QGraphicsItem):
+    """Draw parametric lane lines and road surface in Canvas2D."""
+
+    def __init__(self, scene_cfg: SceneConfig, parent=None):
+        super().__init__(parent)
+        self.scene_cfg = scene_cfg
+        self.setZValue(0)  # Draw below sensor FOVs (Z=1) and vehicle (Z=5)
+
+    def boundingRect(self):
+        return QRectF(-200, -600, 400, 1200)
+
+    def paint(self, painter, option, widget=None):
+        lp = self.scene_cfg.lane_params
+        if lp.left_lines <= 0 and lp.right_lines <= 0:
+            return
+
+        y_start = -lp.length / 2.0
+        y_end = lp.length / 2.0
+        num_points = max(20, int(abs(y_end - y_start) / 2))
+        ys = np.linspace(y_start, y_end, num_points)
+
+        # Helper to compute xs for a given base x
+        def get_xs(x_base):
+            c = 1.0 / (2.0 * lp.curvature_r) if lp.curvature_r != 0.0 else 0.0
+            return x_base + c * (ys - y_start) ** 2
+
+        # Compute outermost profiles for road background
+        if lp.left_lines > 0:
+            x_left_most = lp.lateral_offset - (lp.left_lines - 0.5) * lp.lane_width
+        else:
+            x_left_most = lp.lateral_offset - 0.5 * lp.lane_width
+
+        if lp.right_lines > 0:
+            x_right_most = lp.lateral_offset + (lp.right_lines - 0.5) * lp.lane_width
+        else:
+            x_right_most = lp.lateral_offset + 0.5 * lp.lane_width
+
+        xs_min = get_xs(x_left_most)
+        xs_max = get_xs(x_right_most)
+
+        # Draw dark road background surface (#21262D)
+        road_path = QPainterPath()
+        road_path.moveTo(xs_min[0], -ys[0])
+        for i in range(1, len(ys)):
+            road_path.lineTo(xs_min[i], -ys[i])
+        for i in range(len(ys) - 1, -1, -1):
+            road_path.lineTo(xs_max[i], -ys[i])
+        road_path.closeSubpath()
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor("#21262D")))
+        painter.drawPath(road_path)
+
+        # Draw left lane lines
+        for idx in range(1, lp.left_lines + 1):
+            x_base = lp.lateral_offset - (idx - 0.5) * lp.lane_width
+            xs = get_xs(x_base)
+
+            is_outer = (idx == lp.left_lines)
+            color = lp.color_outer if is_outer else lp.color_inner
+            style = Qt.SolidLine if is_outer else Qt.DashLine
+
+            pen = QPen(QColor(color), lp.line_width, style)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+
+            path = QPainterPath()
+            path.moveTo(xs[0], -ys[0])
+            for i in range(1, len(ys)):
+                path.lineTo(xs[i], -ys[i])
+            painter.drawPath(path)
+
+        # Draw right lane lines
+        for idx in range(1, lp.right_lines + 1):
+            x_base = lp.lateral_offset + (idx - 0.5) * lp.lane_width
+            xs = get_xs(x_base)
+
+            is_outer = (idx == lp.right_lines)
+            color = lp.color_outer if is_outer else lp.color_inner
+            style = Qt.SolidLine if is_outer else Qt.DashLine
+
+            pen = QPen(QColor(color), lp.line_width, style)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+
+            path = QPainterPath()
+            path.moveTo(xs[0], -ys[0])
+            for i in range(1, len(ys)):
+                path.lineTo(xs[i], -ys[i])
+            painter.drawPath(path)
+
+
+class TargetVehicleItem(QGraphicsItem):
+    """Top-down view of a target vehicle."""
+
+    def __init__(self, cfg: TargetVehicleConfig, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.setZValue(5)  # Layer same as Ego vehicle (above sensors)
+
+    def boundingRect(self):
+        w, l = self.cfg.width, self.cfg.length
+        # Extra padding for rotation and text bounds
+        max_dim = max(w, l) + 2.0
+        return QRectF(-max_dim, -max_dim, 2 * max_dim, 2 * max_dim)
+
+    def paint(self, painter, option, widget=None):
+        if not self.cfg.enabled:
+            return
+
+        w, l = self.cfg.width, self.cfg.length
+
+        painter.save()
+
+        # Target vehicle is positioned at (cfg.x, -cfg.y) in scene coordinates
+        # And rotated by cfg.heading
+        painter.translate(self.cfg.x, -self.cfg.y)
+        painter.rotate(self.cfg.heading)
+
+        # Draw vehicle body (rect centered at (0,0) in rotated local frame)
+        # Note: in rotated frame, y is longitudinal (along heading), x is lateral
+        # So we draw from -w/2 to w/2 and -l/2 to l/2
+        veh_rect = QRectF(-w / 2, -l / 2, w, l)
+
+        # Body fill with custom target color
+        color = QColor(self.cfg.color)
+        painter.setBrush(QBrush(color))
+        painter.setPen(QPen(QColor("#888888"), 0.05))
+        painter.drawRoundedRect(veh_rect, 0.3, 0.3)
+
+        # Windshield/Forward indicator area
+        painter.setBrush(QBrush(QColor("#FFFFFF")))
+        painter.setOpacity(0.3)
+        painter.setPen(Qt.NoPen)
+        # Windshield is at front half of vehicle, i.e. local y = -l/2 to -l/4
+        painter.drawRoundedRect(QRectF(-w / 2 + 0.15, -l / 2 + 0.1, w - 0.3, l * 0.25), 0.2, 0.2)
+        painter.setOpacity(1.0)
+
+        # Central label showing name (e.g. "T1")
+        font = QFont("Arial", 6)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(veh_rect, Qt.AlignCenter, self.cfg.name)
+
+        # Small forward arrow pointing in heading direction (local -y)
+        painter.setPen(QPen(QColor("#FFFFFF"), 0.06))
+        painter.drawLine(QPointF(0, -l/2 + 0.5), QPointF(0, -l/2 - 0.3))
+        painter.drawLine(QPointF(0, -l/2 - 0.3), QPointF(-0.12, -l/2 - 0.15))
+        painter.drawLine(QPointF(0, -l/2 - 0.3), QPointF(0.12, -l/2 - 0.15))
+
+        painter.restore()
+
+
 # ══════════════════════════════════════════════════════════════
 #  2-D CANVAS
 # ══════════════════════════════════════════════════════════════
@@ -800,6 +1026,9 @@ class Canvas2D(QGraphicsView):
         self._grid = GridItem(600)
         self._scene.addItem(self._grid)
 
+        self._lanes = LanesItem(scene_cfg)
+        self._scene.addItem(self._lanes)
+
         self._vehicle = VehicleItem(scene_cfg.vehicle)
         self._scene.addItem(self._vehicle)
 
@@ -807,11 +1036,17 @@ class Canvas2D(QGraphicsView):
         self._scene.addItem(self._scale_bar)
         self._scale_bar.setPos(-580, 560)   # bottom-left in scene meters (ignored transform)
 
+        self._target_vehicle_items: dict[str, TargetVehicleItem] = {}
+
         # Connect signals
         signals.sensor_changed.connect(self._on_sensor_changed)
         signals.sensor_removed.connect(self._remove_item)
         signals.vehicle_changed.connect(self._on_vehicle_changed)
         signals.scene_rebuilt.connect(self.rebuild)
+        signals.lane_changed.connect(self._on_lane_changed)
+        signals.target_vehicle_added.connect(self._on_target_vehicle_added)
+        signals.target_vehicle_removed.connect(self._on_target_vehicle_removed)
+        signals.target_vehicle_changed.connect(self._on_target_vehicle_changed)
 
         self.rebuild()
 
@@ -827,7 +1062,15 @@ class Canvas2D(QGraphicsView):
         for sensor in self.scene_cfg.sensors:
             self._add_sensor_item(sensor)
 
+        for item in list(self._target_vehicle_items.values()):
+            self._scene.removeItem(item)
+        self._target_vehicle_items.clear()
+
+        for tv in self.scene_cfg.target_vehicles:
+            self._add_target_vehicle_item(tv)
+
         self._grid.setVisible(self.scene_cfg.show_grid)
+        self._on_lane_changed()
 
     def _add_sensor_item(self, sensor: SensorConfig):
         item = SensorGraphicsItem(sensor, self.signals)
@@ -851,6 +1094,36 @@ class Canvas2D(QGraphicsView):
     def _on_vehicle_changed(self):
         self._vehicle.prepareGeometryChange()
         self._vehicle.update()
+        self.viewport().update()
+
+    def _on_lane_changed(self):
+        self._lanes.prepareGeometryChange()
+        self._lanes.update()
+        self.viewport().update()
+
+    def _add_target_vehicle_item(self, tv: TargetVehicleConfig):
+        item = TargetVehicleItem(tv)
+        self._scene.addItem(item)
+        self._target_vehicle_items[tv.id] = item
+
+    def _on_target_vehicle_added(self, tv_id: str):
+        for tv in self.scene_cfg.target_vehicles:
+            if tv.id == tv_id:
+                self._add_target_vehicle_item(tv)
+                break
+        self.viewport().update()
+
+    def _on_target_vehicle_removed(self, tv_id: str):
+        item = self._target_vehicle_items.pop(tv_id, None)
+        if item:
+            self._scene.removeItem(item)
+        self.viewport().update()
+
+    def _on_target_vehicle_changed(self, tv_id: str):
+        item = self._target_vehicle_items.get(tv_id)
+        if item:
+            item.prepareGeometryChange()
+            item.update()
         self.viewport().update()
 
     # ── view control ──────────────────────────────────────────
@@ -917,9 +1190,12 @@ class Canvas2D(QGraphicsView):
         self.viewport().update()
 
     # ── interaction ───────────────────────────────────────────
+    def zoom(self, factor):
+        self.scale(factor, factor)
+
     def wheelEvent(self, event):
         factor = 1.18 if event.angleDelta().y() > 0 else 1 / 1.18
-        self.scale(factor, factor)
+        self.zoom(factor)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MiddleButton:
@@ -1233,8 +1509,10 @@ class Canvas3D(QWidget):
 
         self.fig = Figure(facecolor="#1E1E1E")
         self.canvas = FigureCanvas(self.fig)
+        self.canvas.setFocusPolicy(Qt.StrongFocus)
         self._nav = NavToolbar(self.canvas, self)
-        self._nav.setStyleSheet("background:#2B2B2B; color:#DDDDDD;")
+        self.canvas.toolbar = self._nav
+        self._nav.setStyleSheet("background:#2B2B2B; color:#DDDDDD; qproperty-iconSize: 16px 16px; QToolButton { padding: 2px; border: none; background: transparent; } QToolButton:hover { background: #404040; }")
         fig_layout.addWidget(self._nav)
         fig_layout.addWidget(self.canvas, stretch=1)
         splitter.addWidget(fig_widget)
@@ -2169,6 +2447,367 @@ class VehiclePropertiesPanel(QWidget):
         self.signals.vehicle_changed.emit()
 
 
+class LaneConfigPanel(QWidget):
+    """Parametric lane line configuration panel."""
+
+    def __init__(self, scene_cfg: SceneConfig, signals: AppSignals, parent=None):
+        super().__init__(parent)
+        self.scene_cfg = scene_cfg
+        self.signals = signals
+        self._updating = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        title = QLabel("🛣️ 车道线参数")
+        tf = QFont()
+        tf.setBold(True)
+        title.setFont(tf)
+        title.setAlignment(Qt.AlignCenter)
+        root.addWidget(title)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight)
+        form.setSpacing(6)
+
+        self._lane_width = QDoubleSpinBox()
+        self._lane_width.setRange(1.0, 15.0)
+        self._lane_width.setDecimals(2)
+        self._lane_width.setSingleStep(0.25)
+        self._lane_width.setSuffix(" m")
+
+        self._line_width = QDoubleSpinBox()
+        self._line_width.setRange(0.01, 2.0)
+        self._line_width.setDecimals(2)
+        self._line_width.setSingleStep(0.05)
+        self._line_width.setSuffix(" m")
+
+        self._lateral_offset = QDoubleSpinBox()
+        self._lateral_offset.setRange(-50.0, 50.0)
+        self._lateral_offset.setDecimals(2)
+        self._lateral_offset.setSingleStep(0.5)
+        self._lateral_offset.setSuffix(" m")
+
+        self._curvature_r = QDoubleSpinBox()
+        self._curvature_r.setRange(-10000.0, 10000.0)
+        self._curvature_r.setDecimals(1)
+        self._curvature_r.setSingleStep(50.0)
+        self._curvature_r.setSuffix(" m")
+        self._curvature_r.setToolTip("弯道半径 R (0=直道)")
+
+        self._left_lines = QSpinBox()
+        self._left_lines.setRange(0, 10)
+
+        self._right_lines = QSpinBox()
+        self._right_lines.setRange(0, 10)
+
+        self._length = QDoubleSpinBox()
+        self._length.setRange(10.0, 1000.0)
+        self._length.setDecimals(1)
+        self._length.setSingleStep(10.0)
+        self._length.setSuffix(" m")
+
+        form.addRow("车道中到中宽:", self._lane_width)
+        form.addRow("车道线自身宽:", self._line_width)
+        form.addRow("横向Y0面偏移:", self._lateral_offset)
+        form.addRow("曲率半径 R:", self._curvature_r)
+        form.addRow("左侧车道线数:", self._left_lines)
+        form.addRow("右侧车道线数:", self._right_lines)
+        form.addRow("车道线长度:", self._length)
+
+        root.addLayout(form)
+
+        colors_layout = QHBoxLayout()
+        self._btn_outer = QPushButton("外侧边界颜色")
+        self._btn_inner = QPushButton("内侧分界颜色")
+        colors_layout.addWidget(self._btn_outer)
+        colors_layout.addWidget(self._btn_inner)
+        root.addLayout(colors_layout)
+
+        root.addStretch()
+
+        self._lane_width.valueChanged.connect(self._on_changed)
+        self._line_width.valueChanged.connect(self._on_changed)
+        self._lateral_offset.valueChanged.connect(self._on_changed)
+        self._curvature_r.valueChanged.connect(self._on_changed)
+        self._left_lines.valueChanged.connect(self._on_changed)
+        self._right_lines.valueChanged.connect(self._on_changed)
+        self._length.valueChanged.connect(self._on_changed)
+
+        self._btn_outer.clicked.connect(self._choose_color_outer)
+        self._btn_inner.clicked.connect(self._choose_color_inner)
+
+        self._load()
+        signals.scene_rebuilt.connect(self._load)
+
+    def _load(self, *_):
+        self._updating = True
+        lp = self.scene_cfg.lane_params
+        self._lane_width.setValue(lp.lane_width)
+        self._line_width.setValue(lp.line_width)
+        self._lateral_offset.setValue(lp.lateral_offset)
+        self._curvature_r.setValue(lp.curvature_r)
+        self._left_lines.setValue(lp.left_lines)
+        self._right_lines.setValue(lp.right_lines)
+        self._length.setValue(lp.length)
+
+        self._btn_outer.setStyleSheet(f"background-color: {lp.color_outer}; color: {'#000000' if QColor(lp.color_outer).lightness() > 128 else '#ffffff'};")
+        self._btn_inner.setStyleSheet(f"background-color: {lp.color_inner}; color: {'#000000' if QColor(lp.color_inner).lightness() > 128 else '#ffffff'};")
+
+        self._updating = False
+
+    def _on_changed(self):
+        if self._updating:
+            return
+        lp = self.scene_cfg.lane_params
+        lp.lane_width = self._lane_width.value()
+        lp.line_width = self._line_width.value()
+        lp.lateral_offset = self._lateral_offset.value()
+        lp.curvature_r = self._curvature_r.value()
+        lp.left_lines = self._left_lines.value()
+        lp.right_lines = self._right_lines.value()
+        lp.length = self._length.value()
+
+        self.signals.lane_changed.emit()
+
+    def _choose_color_outer(self):
+        lp = self.scene_cfg.lane_params
+        col = QColorDialog.getColor(QColor(lp.color_outer), self, "选择外侧边界线颜色")
+        if col.isValid():
+            lp.color_outer = col.name()
+            self._load()
+            self.signals.lane_changed.emit()
+
+    def _choose_color_inner(self):
+        lp = self.scene_cfg.lane_params
+        col = QColorDialog.getColor(QColor(lp.color_inner), self, "选择内侧分界线颜色")
+        if col.isValid():
+            lp.color_inner = col.name()
+            self._load()
+            self.signals.lane_changed.emit()
+
+
+class TargetVehiclePanel(QWidget):
+    """Target vehicles management panel."""
+
+    def __init__(self, scene_cfg: SceneConfig, signals: AppSignals, parent=None):
+        super().__init__(parent)
+        self.scene_cfg = scene_cfg
+        self.signals = signals
+        self._updating = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        title = QLabel("🚘 目标车配置")
+        tf = QFont()
+        tf.setBold(True)
+        title.setFont(tf)
+        title.setAlignment(Qt.AlignCenter)
+        root.addWidget(title)
+
+        self._list_widget = QListWidget()
+        self._list_widget.setMaximumHeight(120)
+        root.addWidget(self._list_widget)
+
+        btn_layout = QHBoxLayout()
+        self._btn_add = QPushButton("添加目标车")
+        self._btn_del = QPushButton("删除选中")
+        btn_layout.addWidget(self._btn_add)
+        btn_layout.addWidget(self._btn_del)
+        root.addLayout(btn_layout)
+
+        self._prop_group = QGroupBox("目标车属性")
+        form = QFormLayout(self._prop_group)
+        form.setLabelAlignment(Qt.AlignRight)
+        form.setSpacing(6)
+
+        self._name = QLineEdit()
+        self._x = QDoubleSpinBox()
+        self._x.setRange(-100.0, 100.0)
+        self._x.setDecimals(2)
+        self._x.setSingleStep(0.5)
+        self._x.setSuffix(" m")
+
+        self._y = QDoubleSpinBox()
+        self._y.setRange(-200.0, 500.0)
+        self._y.setDecimals(2)
+        self._y.setSingleStep(1.0)
+        self._y.setSuffix(" m")
+
+        self._heading = QDoubleSpinBox()
+        self._heading.setRange(-180.0, 180.0)
+        self._heading.setDecimals(1)
+        self._heading.setSingleStep(5.0)
+        self._heading.setSuffix(" °")
+
+        self._len = QDoubleSpinBox()
+        self._len.setRange(0.5, 30.0)
+        self._len.setDecimals(2)
+        self._len.setSingleStep(0.1)
+        self._len.setSuffix(" m")
+
+        self._wid = QDoubleSpinBox()
+        self._wid.setRange(0.5, 8.0)
+        self._wid.setDecimals(2)
+        self._wid.setSingleStep(0.1)
+        self._wid.setSuffix(" m")
+
+        self._btn_color = QPushButton("选择车身颜色")
+        self._enabled = QCheckBox("启用渲染")
+
+        form.addRow("名称:", self._name)
+        form.addRow("横向 X (Y0偏移):", self._x)
+        form.addRow("纵向 Y (车前):", self._y)
+        form.addRow("航向角 Heading:", self._heading)
+        form.addRow("车身长度:", self._len)
+        form.addRow("车身宽度:", self._wid)
+        form.addRow("车身颜色:", self._btn_color)
+        form.addRow("", self._enabled)
+
+        root.addWidget(self._prop_group)
+        root.addStretch()
+
+        self._list_widget.currentRowChanged.connect(self._on_selection_changed)
+        self._btn_add.clicked.connect(self._add_target_vehicle)
+        self._btn_del.clicked.connect(self._del_target_vehicle)
+
+        self._name.textChanged.connect(self._on_changed)
+        self._x.valueChanged.connect(self._on_changed)
+        self._y.valueChanged.connect(self._on_changed)
+        self._heading.valueChanged.connect(self._on_changed)
+        self._len.valueChanged.connect(self._on_changed)
+        self._wid.valueChanged.connect(self._on_changed)
+        self._enabled.toggled.connect(self._on_changed)
+        self._btn_color.clicked.connect(self._choose_color)
+
+        self._sync_list()
+        self._update_prop_enables()
+
+        signals.scene_rebuilt.connect(self._on_scene_rebuilt)
+
+    def _on_scene_rebuilt(self):
+        self._sync_list()
+
+    def _sync_list(self):
+        self._updating = True
+        self._list_widget.clear()
+        for tv in self.scene_cfg.target_vehicles:
+            item = QListWidgetItem(f"{tv.name} (X:{tv.x:.1f}, Y:{tv.y:.1f})")
+            item.setData(Qt.UserRole, tv.id)
+            self._list_widget.addItem(item)
+        self._updating = False
+
+        if self.scene_cfg.target_vehicles:
+            self._list_widget.setCurrentRow(0)
+        else:
+            self._update_prop_enables()
+
+    def _selected_tv(self) -> Optional[TargetVehicleConfig]:
+        row = self._list_widget.currentRow()
+        if row < 0 or row >= len(self.scene_cfg.target_vehicles):
+            return None
+        tv_id = self._list_widget.item(row).data(Qt.UserRole)
+        for tv in self.scene_cfg.target_vehicles:
+            if tv.id == tv_id:
+                return tv
+        return None
+
+    def _on_selection_changed(self, row):
+        if self._updating:
+            return
+        tv = self._selected_tv()
+        if not tv:
+            self._update_prop_enables()
+            return
+
+        self._updating = True
+        self._name.setText(tv.name)
+        self._x.setValue(tv.x)
+        self._y.setValue(tv.y)
+        self._heading.setValue(tv.heading)
+        self._len.setValue(tv.length)
+        self._wid.setValue(tv.width)
+        self._enabled.setChecked(tv.enabled)
+        self._btn_color.setStyleSheet(f"background-color: {tv.color}; color: {'#000000' if QColor(tv.color).lightness() > 128 else '#ffffff'};")
+        self._updating = False
+
+        self._update_prop_enables()
+        self.signals.target_vehicle_selected.emit(tv.id)
+
+    def _update_prop_enables(self):
+        has_sel = (self._selected_tv() is not None)
+        self._prop_group.setEnabled(has_sel)
+
+    def _add_target_vehicle(self):
+        idx = len(self.scene_cfg.target_vehicles) + 1
+        x_default = 3.75
+        if self.scene_cfg.lane_params.left_lines > 0:
+            x_default = -self.scene_cfg.lane_params.lane_width
+        elif self.scene_cfg.lane_params.right_lines > 0:
+            x_default = self.scene_cfg.lane_params.lane_width
+
+        tv = TargetVehicleConfig(
+            name=f"T{idx}",
+            x=x_default,
+            y=20.0 + idx * 5.0,
+            heading=0.0,
+            length=4.8,
+            width=2.0,
+            color="#FF5252",
+            enabled=True
+        )
+        self.scene_cfg.target_vehicles.append(tv)
+        self._sync_list()
+        for i in range(self._list_widget.count()):
+            if self._list_widget.item(i).data(Qt.UserRole) == tv.id:
+                self._list_widget.setCurrentRow(i)
+                break
+        self.signals.target_vehicle_added.emit(tv.id)
+
+    def _del_target_vehicle(self):
+        tv = self._selected_tv()
+        if not tv:
+            return
+        self.scene_cfg.target_vehicles.remove(tv)
+        self._sync_list()
+        self.signals.target_vehicle_removed.emit(tv.id)
+
+    def _choose_color(self):
+        tv = self._selected_tv()
+        if not tv:
+            return
+        col = QColorDialog.getColor(QColor(tv.color), self, "选择车身颜色")
+        if col.isValid():
+            tv.color = col.name()
+            self._btn_color.setStyleSheet(f"background-color: {tv.color}; color: {'#000000' if QColor(tv.color).lightness() > 128 else '#ffffff'};")
+            self.signals.target_vehicle_changed.emit(tv.id)
+
+    def _on_changed(self):
+        if self._updating:
+            return
+        tv = self._selected_tv()
+        if not tv:
+            return
+        tv.name = self._name.text()
+        tv.x = self._x.value()
+        tv.y = self._y.value()
+        tv.heading = self._heading.value()
+        tv.length = self._len.value()
+        tv.width = self._wid.value()
+        tv.enabled = self._enabled.isChecked()
+
+        row = self._list_widget.currentRow()
+        if row >= 0:
+            self._updating = True
+            self._list_widget.item(row).setText(f"{tv.name} (X:{tv.x:.1f}, Y:{tv.y:.1f})")
+            self._updating = False
+
+        self.signals.target_vehicle_changed.emit(tv.id)
+
+
 # ═════════════════════════════════════════════════════════════
 #  SENSOR GROUND-INTERSECTION TABLE
 # ═════════════════════════════════════════════════════════════
@@ -2227,7 +2866,6 @@ def compute_ground_intersections(s: 'SensorConfig'):
                     nearest=None, ground_y=None)
 
     nearest = min(candidates)
-    # 世界 Y 坐标：最近点位于传感器中心线方向上距 s.y 为 nearest
     ground_y = s.y + nearest * math.cos(az)
     return dict(lower=lower, upper=upper, center=cent, range_=range_hit,
                 nearest=nearest, ground_y=ground_y)
@@ -2555,8 +3193,10 @@ class CanvasSideView(QWidget):
         # ── Matplotlib canvas ─────────────────────────────────
         self._fig = Figure(facecolor="#1E1E1E")
         self._canvas = FigureCanvas(self._fig)
+        self._canvas.setFocusPolicy(Qt.StrongFocus)
         self._nav = NavToolbar(self._canvas, self)
-        self._nav.setStyleSheet("background:#2B2B2B; border:none;")
+        self._canvas.toolbar = self._nav
+        self._nav.setStyleSheet("background:#2B2B2B; border:none; qproperty-iconSize: 16px 16px; QToolButton { padding: 2px; border: none; background: transparent; } QToolButton:hover { background: #404040; }")
         layout.addWidget(self._nav)
         layout.addWidget(self._canvas, stretch=1)
 
@@ -3434,13 +4074,19 @@ class CanvasBlindZoneView(QWidget):
         ctrl_widget.setStyleSheet("background:#2B2B2B;")
         layout.addWidget(ctrl_widget)
 
-        # Matplotlib canvas
         self._fig = Figure(facecolor="#1E1E1E")
         self._canvas = FigureCanvas(self._fig)
+        self._canvas.setFocusPolicy(Qt.StrongFocus)
         self._nav = NavToolbar(self._canvas, self)
-        self._nav.setStyleSheet("background:#2B2B2B; border:none;")
+        self._canvas.toolbar = self._nav
+        self._nav.setStyleSheet("background:#2B2B2B; border:none; qproperty-iconSize: 16px 16px; QToolButton { padding: 2px; border: none; background: transparent; } QToolButton:hover { background: #404040; }")
         layout.addWidget(self._nav)
         layout.addWidget(self._canvas, stretch=1)   # stretch=1 → canvas takes all spare space
+
+        # 右键点击查询覆盖详情
+        self._fig.canvas.mpl_connect('button_press_event', self._on_canvas_click)
+        # 保存最新一次渲染的覆盖数据，供点击查询用
+        self._last_cover = None   # (C, X, Y, xs, ys, analyze_mask, z_levels)
 
         # 延迟重绘
         self._timer = QTimer()
@@ -3457,6 +4103,37 @@ class CanvasBlindZoneView(QWidget):
     def _delayed_redraw(self, *_):
         self._timer.start(450)
 
+    def _on_canvas_click(self, event):
+        """右键点击盲区图：弹窗显示该点的覆盖详情。"""
+        if event.button != 3:   # 仅响应右键 (matplotlib: 1=左, 2=中, 3=右)
+            return
+        if self._last_cover is None or event.xdata is None or event.ydata is None:
+            return
+
+        C, X, Y, xs, ys, analyze_mask, z_levels, mode_idx = self._last_cover
+        px, py = float(event.xdata), float(event.ydata)
+
+        # 找到最近网格点
+        ix = np.argmin(np.abs(xs - px))
+        iy = np.argmin(np.abs(ys - py))
+        cx_val = int(C[iy, ix])
+        in_veh  = not bool(analyze_mask[iy, ix])
+
+        # 生成报告
+        lines = [f"测试点  X={px:.3f}  Y={py:.3f}"]
+        if in_veh:
+            lines.append("位于车体内部（不计入盲区分析）")
+        else:
+            lines.append(f"覆盖传感器数: {cx_val}")
+            if cx_val == 0:
+                lines.append("❌ 盲区 — 所有高度层均无传感器覆盖")
+            else:
+                lines.append(f"✅ 已覆盖 — 最多 {cx_val} 个传感器在立柱高度内看到该点")
+        lines.append(f"分析模式: {'立柱 0~{z_levels[-1]:.2f}m' if mode_idx == 0 else f'平面 z={z_levels[0]:.2f}m'}")
+
+        msg = "\n".join(lines)
+        QMessageBox.information(self, "盲区测试点查询", msg)
+
     def _current_bounds(self):
         idx = self._range_combo.currentIndex()
         if idx == 0:
@@ -3468,37 +4145,52 @@ class CanvasBlindZoneView(QWidget):
     def _draw_blind_zone_dimensions(self, ax, blind_bin, xs, ys, v):
         """在盲区地块上绘制尺寸标注箭头。
 
-        对每个连续盲区地块：
-        - 在宽度最大处画水平尺寸线 + 标注宽度
-        - 在左侧画纵向尺寸箭头 + 标注深度
-        - 标注该地块距车头距离
-        """
-        from matplotlib.patches import FancyArrowPatch
+        对每个连续盲区地块（由相邻盲区Y行合并）：
+        - 在宽度最大的连续段处画水平尺寸线 + 标注该段宽度
+        - 左侧画纵向尺寸箭头 + 标注深度
+        - 标注距车头距离
 
+        宽度取连续盲区段（不含FOV覆盖"洞"）的最大值，而非整行跨度。
+        """
         if not blind_bin.any():
             return
 
         ny, nx = blind_bin.shape
         res_y = (ys[-1] - ys[0]) / max(ny - 1, 1)
 
-        # 按 Y 行收集每行的盲区 X 范围
-        row_ranges = []          # (y_coord, x_left, x_right, width) or None
-        for ri in range(ny):
-            row = blind_bin[ri, :]
+        def _contiguous_segments(row):
+            """返回该行所有连续 True 段的 (col_start, col_end, xs_left, xs_right, width) 列表"""
             cols = np.where(row)[0]
             if len(cols) == 0:
-                row_ranges.append(None)
+                return []
+            segs = []
+            start = cols[0]
+            for i in range(1, len(cols)):
+                if cols[i] != cols[i-1] + 1:
+                    segs.append((start, cols[i-1],
+                                 xs[start], xs[cols[i-1]],
+                                 xs[cols[i-1]] - xs[start]))
+                    start = cols[i]
+            segs.append((start, cols[-1],
+                         xs[start], xs[cols[-1]],
+                         xs[cols[-1]] - xs[start]))
+            return segs
+
+        # 按 Y 行收集每行最宽连续段
+        row_best = []   # (y, x_left, x_right, width) or None
+        for ri in range(ny):
+            segs = _contiguous_segments(blind_bin[ri, :])
+            if not segs:
+                row_best.append(None)
                 continue
-            x_left  = xs[cols[0]]
-            x_right = xs[cols[-1]]
-            width   = x_right - x_left
-            row_ranges.append((ys[ri], x_left, x_right, width))
+            best_seg = max(segs, key=lambda s: s[4])  # widest segment
+            row_best.append((ys[ri], best_seg[2], best_seg[3], best_seg[4]))
 
         # 按连续 Y 行分割成不同地块
         chunks = []
         chunk_start = None
         for ri in range(ny):
-            if row_ranges[ri] is not None:
+            if row_best[ri] is not None:
                 if chunk_start is None:
                     chunk_start = ri
             else:
@@ -3516,28 +4208,28 @@ class CanvasBlindZoneView(QWidget):
         text_color = '#FFAB91'
 
         for y_start, y_end in chunks:
-            # 地块范围内找宽度最大的行
+            # 地块范围内找宽度最大的最宽连续段
             max_w = 0.0
             best_ri = y_start
             for ri in range(y_start, y_end + 1):
-                _, _, _, w = row_ranges[ri]
+                *_, w = row_best[ri]
                 if w > max_w:
                     max_w = w
                     best_ri = ri
 
-            best = row_ranges[best_ri]
+            best = row_best[best_ri]
             yc, xl, xr, bw = best
 
             y_top = ys[y_start]
             y_bot = ys[y_end]
 
-            # 用地块实际边界防止标注跑出图外
-            x_left_all = [row_ranges[ri][1] for ri in range(y_start, y_end + 1)]
-            x_right_all = [row_ranges[ri][2] for ri in range(y_start, y_end + 1)]
+            # 用地块内所有最宽段的极值左右边界（而非整行跨度）
+            x_left_all = [row_best[ri][1] for ri in range(y_start, y_end + 1)]
+            x_right_all = [row_best[ri][2] for ri in range(y_start, y_end + 1)]
             real_xl = min(x_left_all)
             real_xr = max(x_right_all)
 
-            # ── 水平尺寸线（最宽处） ──
+            # ── 水平尺寸线（最宽连续段处） ──
             h_offset = 0.5
             ax.annotate(
                 "", xy=(real_xl, yc + h_offset),
@@ -3758,7 +4450,7 @@ class CanvasBlindZoneView(QWidget):
                     color='#DDDDDD', fontsize=7,
                     ha='center', va='center', zorder=6)
 
-        # FOV 轮廓
+        # FOV 轮廓 — 真实地面交线（非全圆）
         if self._show_fov.isChecked():
             for s in self.scene_cfg.sensors:
                 if not s.enabled:
@@ -3766,18 +4458,72 @@ class CanvasBlindZoneView(QWidget):
                 hex_c = s.color.lstrip('#')
                 rgb = tuple(int(hex_c[i:i+2], 16) / 255.0 for i in (0, 2, 4))
                 h2 = s.hfov / 2.0
-                a = np.radians(np.linspace(s.mount_angle - h2,
-                                           s.mount_angle + h2, 60))
-                arc_x = s.x + s.range * np.sin(a)
-                arc_y = s.y + s.range * np.cos(a)
-                poly_x = np.concatenate([[s.x], arc_x, [s.x]])
-                poly_y = np.concatenate([[s.y], arc_y, [s.y]])
+                azs = np.radians(np.linspace(s.mount_angle - h2,
+                                             s.mount_angle + h2, 60))
+                pitch_rad = math.radians(getattr(s, 'pitch', 0.0))
+                v2_rad = math.radians(s.vfov / 2.0)
+                sz = max(float(s.z), 0.05)
+                rng = float(s.range)
+
+                # — 下沿落地水平距离 —
+                el_lo = pitch_rad - v2_rad
+                if math.sin(el_lo) < -1e-6:
+                    t_lo = sz / (-math.sin(el_lo))
+                    near_xy = math.sqrt(max(t_lo * t_lo - sz * sz, 0.0))
+                    near_xy = min(near_xy, rng)
+                else:
+                    near_xy = 0.0
+
+                # — 上沿 / range 弧 —
+                el_hi = pitch_rad + v2_rad
+                if math.sin(el_hi) < -1e-6:
+                    t_hi = sz / (-math.sin(el_hi))
+                    far_xy = math.sqrt(max(t_hi * t_hi - sz * sz, 0.0))
+                    far_xy = min(far_xy, rng)
+                else:
+                    far_xy = math.sqrt(max(rng * rng - sz * sz, 0.0))
+
+                near_x = s.x + near_xy * np.sin(azs)
+                near_y = s.y + near_xy * np.cos(azs)
+                far_x  = s.x + far_xy  * np.sin(azs)
+                far_y  = s.y + far_xy  * np.cos(azs)
+
+                # 填充地面交线扇形
+                poly_x = np.concatenate([near_x, far_x[::-1]])
+                poly_y = np.concatenate([near_y, far_y[::-1]])
                 ax.fill(poly_x, poly_y, color=rgb,
-                        alpha=min(s.opacity * 1.2, 0.20), zorder=3)
-                ax.plot(arc_x, arc_y, color=s.color,
-                        linewidth=0.7, alpha=0.7, zorder=4)
+                        alpha=min(s.opacity * 0.9, 0.14), zorder=3)
+                # 下沿弧
+                ax.plot(near_x, near_y, color=s.color,
+                        linewidth=0.6, alpha=0.5, zorder=4)
+                # 上沿/range 弧
+                ax.plot(far_x, far_y, color=s.color,
+                        linewidth=0.8, alpha=0.6, zorder=4)
+                # 两侧边线
+                ax.plot([near_x[0], far_x[0]], [near_y[0], far_y[0]],
+                        color=s.color, linewidth=0.5, alpha=0.4, zorder=4)
+                ax.plot([near_x[-1], far_x[-1]], [near_y[-1], far_y[-1]],
+                        color=s.color, linewidth=0.5, alpha=0.4, zorder=4)
+                # 传感器位置
                 ax.scatter([s.x], [s.y], color=s.color, s=22, zorder=7,
                            edgecolors='white', linewidths=0.6)
+
+                # 最近地面落点标注
+                info = compute_ground_intersections(s)
+                nd = info['nearest']
+                gy = info['ground_y']
+                if nd is not None and gy is not None:
+                    nx = s.x + nd * math.sin(math.radians(s.mount_angle))
+                    # 菱形标记
+                    ax.scatter([nx], [gy], marker='D', s=36,
+                               color=s.color, edgecolors='white',
+                               linewidths=0.7, zorder=15, alpha=0.9)
+                    # 距离标签
+                    ax.text(nx, gy + 0.45, f"{nd:.1f} m",
+                            color=s.color, fontsize=6, fontweight='bold',
+                            ha='center', va='bottom', zorder=16,
+                            bbox=dict(boxstyle='round,pad=0.15',
+                                      fc='#0D1117', ec=s.color, alpha=0.85))
 
         # 原点标记 (车头前保险杠)
         ax.axhline(0.0, color='#888888', linewidth=0.6,
@@ -3804,6 +4550,10 @@ class CanvasBlindZoneView(QWidget):
 
         self._fig.tight_layout(pad=0.8)
         self._fig.subplots_adjust(left=0.07, right=0.99, top=0.95, bottom=0.07)
+
+        # 保存覆盖数据，供点击查询用
+        self._last_cover = (C, X, Y, xs, ys, analyze_mask, z_levels, mode_idx)
+
         self._canvas.draw()
 
 
@@ -3974,6 +4724,94 @@ def export_diagram_hq(scene_cfg: 'SceneConfig', path: str,
         # Mount dot
         ax.plot(cx, cy, 'o', color=s.color, markersize=3.5,
                 markeredgecolor='white', markeredgewidth=0.6, zorder=5)
+
+    # ── Lane Lines and Road Surface ──
+    lp = scene_cfg.lane_params
+    if lp.left_lines > 0 or lp.right_lines > 0:
+        y_start = -lp.length / 2.0
+        y_end = lp.length / 2.0
+        ys = np.linspace(y_start, y_end, 100)
+
+        def get_xs(x_base):
+            c = 1.0 / (2.0 * lp.curvature_r) if lp.curvature_r != 0.0 else 0.0
+            return x_base + c * (ys - y_start) ** 2
+
+        if lp.left_lines > 0:
+            x_left_most = lp.lateral_offset - (lp.left_lines - 0.5) * lp.lane_width
+        else:
+            x_left_most = lp.lateral_offset - 0.5 * lp.lane_width
+
+        if lp.right_lines > 0:
+            x_right_most = lp.lateral_offset + (lp.right_lines - 0.5) * lp.lane_width
+        else:
+            x_right_most = lp.lateral_offset + 0.5 * lp.lane_width
+
+        xs_min = get_xs(x_left_most)
+        xs_max = get_xs(x_right_most)
+
+        # Draw road background surface
+        poly_x = np.concatenate([ys, ys[::-1]])
+        poly_y = np.concatenate([xs_min, xs_max[::-1]])
+        ax.fill(poly_x, poly_y, color="#21262D", zorder=1)
+
+        # Left lines
+        for idx in range(1, lp.left_lines + 1):
+            x_base = lp.lateral_offset - (idx - 0.5) * lp.lane_width
+            xs = get_xs(x_base)
+            is_outer = (idx == lp.left_lines)
+            color = lp.color_outer if is_outer else lp.color_inner
+            style = 'solid' if is_outer else 'dashed'
+            ax.plot(ys, xs, color=color, linestyle=style, linewidth=1.5, zorder=2)
+
+        # Right lines
+        for idx in range(1, lp.right_lines + 1):
+            x_base = lp.lateral_offset + (idx - 0.5) * lp.lane_width
+            xs = get_xs(x_base)
+            is_outer = (idx == lp.right_lines)
+            color = lp.color_outer if is_outer else lp.color_inner
+            style = 'solid' if is_outer else 'dashed'
+            ax.plot(ys, xs, color=color, linestyle=style, linewidth=1.5, zorder=2)
+
+    # ── Target Vehicles ──
+    for tv in scene_cfg.target_vehicles:
+        if not tv.enabled:
+            continue
+        cx, cy = tv.y, tv.x
+        w, l = tv.width, tv.length
+        beta = math.radians(tv.heading)
+        cos_b, sin_b = math.cos(beta), math.sin(beta)
+
+        local_corners = [
+            (l/2, -w/2),
+            (l/2, w/2),
+            (-l/2, w/2),
+            (-l/2, -w/2)
+        ]
+
+        corners = []
+        for lx, ly in local_corners:
+            rx = lx * cos_b - ly * sin_b
+            ry = lx * sin_b + ly * cos_b
+            corners.append((cx + rx, cy + ry))
+
+        poly = mpatches.Polygon(corners, closed=True, facecolor=tv.color, edgecolor='#888888', linewidth=0.8, zorder=6)
+        ax.add_patch(poly)
+
+        ws_corners = []
+        local_ws = [
+            (l/2 - 0.1, -w/2 + 0.15),
+            (l/2 - 0.1, w/2 - 0.15),
+            (l/4, w/2 - 0.15),
+            (l/4, -w/2 + 0.15)
+        ]
+        for lx, ly in local_ws:
+            rx = lx * cos_b - ly * sin_b
+            ry = lx * sin_b + ly * cos_b
+            ws_corners.append((cx + rx, cy + ry))
+        ws_poly = mpatches.Polygon(ws_corners, closed=True, facecolor='#FFFFFF', alpha=0.3, edgecolor='none', zorder=7)
+        ax.add_patch(ws_poly)
+
+        ax.text(cx, cy, tv.name, color='#FFFFFF', fontsize=7, fontweight='bold', ha='center', va='center', zorder=8)
 
     # ── Vehicle (车头前保险杠位于 display (0,0)，车身向 -X 后延伸) ──
     v = scene_cfg.vehicle
@@ -4148,6 +4986,17 @@ class MainWindow(QMainWindow):
                                   self._canvas2d.reset_rotation))
         _ctrl2d_lay.addSpacing(16)
 
+        _zoom_lbl = QLabel("缩放:")
+        _zoom_lbl.setStyleSheet("color:#AAAAAA; font-size:11px;")
+        _ctrl2d_lay.addWidget(_zoom_lbl)
+        _ctrl2d_lay.addWidget(_mb("➕ 放大", "放大视图",
+                                  lambda: self._canvas2d.zoom(1.2)))
+        _ctrl2d_lay.addWidget(_mb("➖ 缩小", "缩小视图",
+                                  lambda: self._canvas2d.zoom(1.2 ** -1)))
+        _ctrl2d_lay.addWidget(_mb("🔍 适中", "自适应视野大小",
+                                  self._canvas2d.fit_view))
+        _ctrl2d_lay.addSpacing(16)
+
         _bg_lbl = QLabel("背景:")
         _bg_lbl.setStyleSheet("color:#AAAAAA; font-size:11px;")
         _ctrl2d_lay.addWidget(_bg_lbl)
@@ -4185,10 +5034,14 @@ class MainWindow(QMainWindow):
         # ── Dock: properties ──────────────────────────────────
         self._prop_panel = SensorPropertiesPanel(self._scene_cfg, self._signals)
         self._vehicle_panel = VehiclePropertiesPanel(self._scene_cfg, self._signals)
+        self._lane_panel = LaneConfigPanel(self._scene_cfg, self._signals)
+        self._target_vehicle_panel = TargetVehiclePanel(self._scene_cfg, self._signals)
         self._prop_tabs = QTabWidget()
         self._prop_tabs.addTab(self._prop_panel, "传感器")
         self._prop_tabs.addTab(self._vehicle_panel, "车辆")
-        dock_prop = QDockWidget("传感器属性", self)
+        self._prop_tabs.addTab(self._lane_panel, "车道线")
+        self._prop_tabs.addTab(self._target_vehicle_panel, "目标车")
+        dock_prop = QDockWidget("参数配置", self)
         dock_prop.setWidget(self._prop_tabs)
         dock_prop.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         dock_prop.setMinimumWidth(240)
