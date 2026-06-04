@@ -1346,7 +1346,7 @@ class Canvas2D(QGraphicsView):
     def _render_legend(self, scene_w: int, scene_h: int,
                        bg_color: Optional[QColor]) -> QImage:
         """Render a color-coded sensor-legend panel sized to fit scene_h."""
-        sensors = self.scene_cfg.sensors
+        sensors = [s for s in self.scene_cfg.sensors if s.enabled]
         if not sensors:
             return QImage()
         n = len(sensors)
@@ -1363,10 +1363,11 @@ class Canvas2D(QGraphicsView):
         usable_h = scene_h - 2 * margin - (n - 1) * gap
         card_h   = max(40, usable_h // n)
 
-        # Font sizes scaled to legend width
+        # Font sizes scaled to legend width and adjusted for card height compression
         scale        = lw / 500.0
-        font_name_pt = max(8,  int(13 * scale))
-        font_fov_pt  = max(6,  int(9  * scale))
+        h_scale      = min(1.0, card_h / 52.0)
+        font_name_pt = max(6,  int(13 * scale * h_scale))
+        font_fov_pt  = max(5,  int(9  * scale * h_scale))
 
         img = QImage(lw, scene_h, QImage.Format_ARGB32_Premultiplied)
 
@@ -4908,17 +4909,17 @@ def export_diagram_hq(scene_cfg: 'SceneConfig', path: str,
         ax_leg.set_ylim(0, 1)
         ax_leg.axis('off')
 
-        n = len(sensors)
+        legend_sensors = [s for s in sensors if s.enabled]
+        n = len(legend_sensors)
         if n:
             gap    = 0.012
             card_h = (1.0 - (n + 1) * gap) / n
-            # Font sizes: derive from actual card height in points
-            # card height in inches = total_h_in * card_h  (axis-fraction → inches)
             card_h_in = total_h_in * card_h
-            name_fs   = max(11.0, min(18.0, card_h_in * 72 * 0.34))
-            fov_fs    = max(9.5, min(14.0, card_h_in * 72 * 0.26))
+            h_scale   = min(1.0, card_h_in / 0.72)
+            name_fs   = max(6.5, min(18.0, card_h_in * 72 * 0.34 * h_scale))
+            fov_fs    = max(5.5, min(14.0, card_h_in * 72 * 0.26 * h_scale))
 
-            for i, s in enumerate(sensors):
+            for i, s in enumerate(legend_sensors):
                 y_top = 1.0 - (i * (card_h + gap) + gap)
                 y_bot = y_top - card_h
 
