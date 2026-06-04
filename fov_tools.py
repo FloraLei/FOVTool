@@ -1258,7 +1258,10 @@ class Canvas2D(QGraphicsView):
     def export_image(self, path: str, width: int = 3000,
                      angle: float = 0.0, bg_color: Optional[QColor] = None,
                      show_legend: bool = True,
-                     title: str = ''):
+                     title: str = '',
+                     export_lanes: bool = True,
+                     export_ego: bool = True,
+                     export_target: bool = True):
         """Render the current scene to a PNG file.
 
         angle       – clockwise rotation applied after rendering (degrees)
@@ -1273,6 +1276,18 @@ class Canvas2D(QGraphicsView):
             scene_img.fill(Qt.transparent)
         else:
             scene_img.fill(bg_color)
+        # Temporarily toggle item visibilities based on user export choice
+        lanes_old = self._lanes.isVisible()
+        ego_old = self._vehicle.isVisible()
+        
+        self._lanes.setVisible(lanes_old and export_lanes)
+        self._vehicle.setVisible(ego_old and export_ego)
+        
+        target_olds = {}
+        for tv_id, tv_item in self._target_vehicle_items.items():
+            target_olds[tv_id] = tv_item.isVisible()
+            tv_item.setVisible(target_olds[tv_id] and export_target)
+
         old_bg = self._scene.backgroundBrush()
         self._scene.setBackgroundBrush(
             QBrush(Qt.NoBrush) if bg_color is None else QBrush(bg_color)
@@ -1283,6 +1298,12 @@ class Canvas2D(QGraphicsView):
         self._scene.render(painter, QRectF(scene_img.rect()), bounds)
         painter.end()
         self._scene.setBackgroundBrush(old_bg)
+        
+        # Restore item visibilities
+        self._lanes.setVisible(lanes_old)
+        self._vehicle.setVisible(ego_old)
+        for tv_id, tv_item in self._target_vehicle_items.items():
+            tv_item.setVisible(target_olds[tv_id])
 
         if show_legend and self.scene_cfg.sensors:
             legend_img = self._render_legend(width, h, bg_color)
@@ -3820,6 +3841,19 @@ class ExportDialog(QDialog):
         self._title_edit.setPlaceholderText("可选：输入导出抬头，不填则不显示")
         layout.addRow("抬头:", self._title_edit)
 
+        # Optional elements checkboxes
+        self._export_lanes_cb = QCheckBox("包含车道线和路面")
+        self._export_lanes_cb.setChecked(True)
+        layout.addRow("导出车道线:", self._export_lanes_cb)
+
+        self._export_ego_cb = QCheckBox("包含主车 (Ego)")
+        self._export_ego_cb.setChecked(True)
+        layout.addRow("导出主车:", self._export_ego_cb)
+
+        self._export_target_cb = QCheckBox("包含目标车辆 (Target)")
+        self._export_target_cb.setChecked(True)
+        layout.addRow("导出目标车:", self._export_target_cb)
+
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.button(QDialogButtonBox.Ok).setText("导出")
         btns.button(QDialogButtonBox.Cancel).setText("取消")
@@ -3846,7 +3880,10 @@ class ExportDialog(QDialog):
         bg = bg_str_map[bi] if hq else bg_qcol_map[bi]
         return (self._width.value(), angle, bg,
             self._legend_cb.isChecked(), hq,
-            self._title_edit.text().strip())
+            self._title_edit.text().strip(),
+            self._export_lanes_cb.isChecked(),
+            self._export_ego_cb.isChecked(),
+            self._export_target_cb.isChecked())
 
 
 # ══════════════════════════════════════════════════════════════
@@ -4571,7 +4608,10 @@ def export_diagram_hq(scene_cfg: 'SceneConfig', path: str,
                       width_px: int = 4000,
                       bg: str = 'white',
                       show_legend: bool = True,
-                      title: str = '') -> None:
+                      title: str = '',
+                      export_lanes: bool = True,
+                      export_ego: bool = True,
+                      export_target: bool = True) -> None:
     """Render a publication-quality 2-D FOV diagram using matplotlib.
 
     Layout  : forward direction → right (landscape orientation)
@@ -4734,115 +4774,118 @@ def export_diagram_hq(scene_cfg: 'SceneConfig', path: str,
                 markeredgecolor='white', markeredgewidth=0.6, zorder=5)
 
     # ── Lane Lines and Road Surface ──
-    lp = scene_cfg.lane_params
-    if lp.left_lines > 0 or lp.right_lines > 0:
-        y_start = -lp.length / 2.0
-        y_end = lp.length / 2.0
-        ys = np.linspace(y_start, y_end, 100)
+    if export_lanes:
+        lp = scene_cfg.lane_params
+        if lp.left_lines > 0 or lp.right_lines > 0:
+            y_start = -lp.length / 2.0
+            y_end = lp.length / 2.0
+            ys = np.linspace(y_start, y_end, 100)
 
-        def get_xs(x_base):
-            c = 1.0 / (2.0 * lp.curvature_r) if lp.curvature_r != 0.0 else 0.0
-            return x_base + c * (ys - y_start) ** 2
+            def get_xs(x_base):
+                c = 1.0 / (2.0 * lp.curvature_r) if lp.curvature_r != 0.0 else 0.0
+                return x_base + c * (ys - y_start) ** 2
 
-        if lp.left_lines > 0:
-            x_left_most = lp.lateral_offset - (lp.left_lines - 0.5) * lp.lane_width
-        else:
-            x_left_most = lp.lateral_offset - 0.5 * lp.lane_width
+            if lp.left_lines > 0:
+                x_left_most = lp.lateral_offset - (lp.left_lines - 0.5) * lp.lane_width
+            else:
+                x_left_most = lp.lateral_offset - 0.5 * lp.lane_width
 
-        if lp.right_lines > 0:
-            x_right_most = lp.lateral_offset + (lp.right_lines - 0.5) * lp.lane_width
-        else:
-            x_right_most = lp.lateral_offset + 0.5 * lp.lane_width
+            if lp.right_lines > 0:
+                x_right_most = lp.lateral_offset + (lp.right_lines - 0.5) * lp.lane_width
+            else:
+                x_right_most = lp.lateral_offset + 0.5 * lp.lane_width
 
-        xs_min = get_xs(x_left_most)
-        xs_max = get_xs(x_right_most)
+            xs_min = get_xs(x_left_most)
+            xs_max = get_xs(x_right_most)
 
-        # Draw road background surface
-        poly_x = np.concatenate([ys, ys[::-1]])
-        poly_y = np.concatenate([xs_min, xs_max[::-1]])
-        ax.fill(poly_x, poly_y, color="#21262D", zorder=1)
+            # Draw road background surface
+            poly_x = np.concatenate([ys, ys[::-1]])
+            poly_y = np.concatenate([xs_min, xs_max[::-1]])
+            ax.fill(poly_x, poly_y, color="#21262D", zorder=1)
 
-        # Left lines
-        for idx in range(1, lp.left_lines + 1):
-            x_base = lp.lateral_offset - (idx - 0.5) * lp.lane_width
-            xs = get_xs(x_base)
-            is_outer = (idx == lp.left_lines)
-            color = lp.color_outer if is_outer else lp.color_inner
-            style = 'solid' if is_outer else 'dashed'
-            ax.plot(ys, xs, color=color, linestyle=style, linewidth=1.5, zorder=2)
+            # Left lines
+            for idx in range(1, lp.left_lines + 1):
+                x_base = lp.lateral_offset - (idx - 0.5) * lp.lane_width
+                xs = get_xs(x_base)
+                is_outer = (idx == lp.left_lines)
+                color = lp.color_outer if is_outer else lp.color_inner
+                style = 'solid' if is_outer else 'dashed'
+                ax.plot(ys, xs, color=color, linestyle=style, linewidth=1.5, zorder=2)
 
-        # Right lines
-        for idx in range(1, lp.right_lines + 1):
-            x_base = lp.lateral_offset + (idx - 0.5) * lp.lane_width
-            xs = get_xs(x_base)
-            is_outer = (idx == lp.right_lines)
-            color = lp.color_outer if is_outer else lp.color_inner
-            style = 'solid' if is_outer else 'dashed'
-            ax.plot(ys, xs, color=color, linestyle=style, linewidth=1.5, zorder=2)
+            # Right lines
+            for idx in range(1, lp.right_lines + 1):
+                x_base = lp.lateral_offset + (idx - 0.5) * lp.lane_width
+                xs = get_xs(x_base)
+                is_outer = (idx == lp.right_lines)
+                color = lp.color_outer if is_outer else lp.color_inner
+                style = 'solid' if is_outer else 'dashed'
+                ax.plot(ys, xs, color=color, linestyle=style, linewidth=1.5, zorder=2)
 
     # ── Target Vehicles ──
-    for tv in scene_cfg.target_vehicles:
-        if not tv.enabled:
-            continue
-        cx, cy = tv.y, tv.x
-        w, l = tv.width, tv.length
-        beta = math.radians(tv.heading)
-        cos_b, sin_b = math.cos(beta), math.sin(beta)
+    if export_target:
+        for tv in scene_cfg.target_vehicles:
+            if not tv.enabled:
+                continue
+            cx, cy = tv.y, tv.x
+            w, l = tv.width, tv.length
+            beta = math.radians(tv.heading)
+            cos_b, sin_b = math.cos(beta), math.sin(beta)
 
-        local_corners = [
-            (l/2, -w/2),
-            (l/2, w/2),
-            (-l/2, w/2),
-            (-l/2, -w/2)
-        ]
+            local_corners = [
+                (l/2, -w/2),
+                (l/2, w/2),
+                (-l/2, w/2),
+                (-l/2, -w/2)
+            ]
 
-        corners = []
-        for lx, ly in local_corners:
-            rx = lx * cos_b - ly * sin_b
-            ry = lx * sin_b + ly * cos_b
-            corners.append((cx + rx, cy + ry))
+            corners = []
+            for lx, ly in local_corners:
+                rx = lx * cos_b - ly * sin_b
+                ry = lx * sin_b + ly * cos_b
+                corners.append((cx + rx, cy + ry))
 
-        poly = mpatches.Polygon(corners, closed=True, facecolor=tv.color, edgecolor='#888888', linewidth=0.8, zorder=6)
-        ax.add_patch(poly)
+            poly = mpatches.Polygon(corners, closed=True, facecolor=tv.color, edgecolor='#888888', linewidth=0.8, zorder=6)
+            ax.add_patch(poly)
 
-        ws_corners = []
-        local_ws = [
-            (l/2 - 0.1, -w/2 + 0.15),
-            (l/2 - 0.1, w/2 - 0.15),
-            (l/4, w/2 - 0.15),
-            (l/4, -w/2 + 0.15)
-        ]
-        for lx, ly in local_ws:
-            rx = lx * cos_b - ly * sin_b
-            ry = lx * sin_b + ly * cos_b
-            ws_corners.append((cx + rx, cy + ry))
-        ws_poly = mpatches.Polygon(ws_corners, closed=True, facecolor='#FFFFFF', alpha=0.3, edgecolor='none', zorder=7)
-        ax.add_patch(ws_poly)
+            ws_corners = []
+            local_ws = [
+                (l/2 - 0.1, -w/2 + 0.15),
+                (l/2 - 0.1, w/2 - 0.15),
+                (l/4, w/2 - 0.15),
+                (l/4, -w/2 + 0.15)
+            ]
+            for lx, ly in local_ws:
+                rx = lx * cos_b - ly * sin_b
+                ry = lx * sin_b + ly * cos_b
+                ws_corners.append((cx + rx, cy + ry))
+            ws_poly = mpatches.Polygon(ws_corners, closed=True, facecolor='#FFFFFF', alpha=0.3, edgecolor='none', zorder=7)
+            ax.add_patch(ws_poly)
 
-        ax.text(cx, cy, tv.name, color='#FFFFFF', fontsize=7, fontweight='bold', ha='center', va='center', zorder=8)
+            ax.text(cx, cy, tv.name, color='#FFFFFF', fontsize=7, fontweight='bold', ha='center', va='center', zorder=8)
 
     # ── Vehicle (车头前保险杠位于 display (0,0)，车身向 -X 后延伸) ──
-    v = scene_cfg.vehicle
-    # 车头矩形
-    ax.add_patch(FancyBboxPatch(
-        (-v.length, -v.width / 2), v.length, v.width,
-        boxstyle='round,pad=0.15',
-        facecolor=veh_face, edgecolor=veh_edge,
-        linewidth=1.5, zorder=6
-    ))
-    # 挂车矩形 (可选)
-    if v.trailer_length > 0:
-        tw = v.effective_trailer_width
+    if export_ego:
+        v = scene_cfg.vehicle
+        # 车头矩形
         ax.add_patch(FancyBboxPatch(
-            (-v.length - v.trailer_length, -tw / 2), v.trailer_length, tw,
-            boxstyle='round,pad=0.10',
+            (-v.length, -v.width / 2), v.length, v.width,
+            boxstyle='round,pad=0.15',
             facecolor=veh_face, edgecolor=veh_edge,
-            linewidth=1.2, zorder=6
+            linewidth=1.5, zorder=6
         ))
-    # 前进方向指示 (F) —— 位于车头前保险杠右侧
-    ax.text(0.6, 0, 'F',
-            ha='left', va='center', fontsize=8,
-            fontweight='bold', color=veh_edge, zorder=7)
+        # 挂车矩形 (可选)
+        if v.trailer_length > 0:
+            tw = v.effective_trailer_width
+            ax.add_patch(FancyBboxPatch(
+                (-v.length - v.trailer_length, -tw / 2), v.trailer_length, tw,
+                boxstyle='round,pad=0.10',
+                facecolor=veh_face, edgecolor=veh_edge,
+                linewidth=1.2, zorder=6
+            ))
+        # 前进方向指示 (F) —— 位于车头前保险杠右侧
+        ax.text(0.6, 0, 'F',
+                ha='left', va='center', fontsize=8,
+                fontweight='bold', color=veh_edge, zorder=7)
 
     # ── Axis ticks & labels ───────────────────────────────────
     tick_fs = max(8.0, min(12.0, diagram_in * 0.65))
@@ -5313,7 +5356,7 @@ class MainWindow(QMainWindow):
         dlg = ExportDialog(self)
         if dlg.exec_() != QDialog.Accepted:
             return
-        width, angle, bg, show_legend, hq_mode, title = dlg.params()
+        width, angle, bg, show_legend, hq_mode, title, export_lanes, export_ego, export_target = dlg.params()
         path, _ = QFileDialog.getSaveFileName(self, "导出 PNG", "fov_diagram.png",
                                                "PNG 图像 (*.png)")
         if not path:
@@ -5327,6 +5370,9 @@ class MainWindow(QMainWindow):
                     bg=bg or 'white',
                     show_legend=show_legend,
                     title=title,
+                    export_lanes=export_lanes,
+                    export_ego=export_ego,
+                    export_target=export_target
                 )
             else:
                 # Standard QGraphicsScene export (bg is a QColor or None)
@@ -5335,6 +5381,9 @@ class MainWindow(QMainWindow):
                     bg_color=bg,
                     show_legend=show_legend,
                     title=title,
+                    export_lanes=export_lanes,
+                    export_ego=export_ego,
+                    export_target=export_target
                 )
             self._status.showMessage(f"已导出: {path}", 4000)
         except Exception as e:
