@@ -505,6 +505,7 @@ class AppSignals(QObject):
     target_vehicle_removed  = pyqtSignal(str)   # target vehicle id
     target_vehicle_changed  = pyqtSignal(str)   # target vehicle id - property edit
     target_vehicle_selected = pyqtSignal(str)   # target vehicle id
+    zoom_mode_changed       = pyqtSignal(bool)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1010,6 +1011,8 @@ class Canvas2D(QGraphicsView):
         self._pan_start = QPointF()
         self._view_angle = 0       # cumulative CW rotation (degrees, multiple of 90)
         self._bg_dark = True       # True = dark, False = light
+        self._zoom_mode = False
+        self._rubber_band = None
 
         # View settings
         self.setRenderHint(QPainter.Antialiasing)
@@ -1206,14 +1209,39 @@ class Canvas2D(QGraphicsView):
         self.zoom(factor)
 
     def mousePressEvent(self, event):
+        if self._zoom_mode and event.button() == Qt.LeftButton:
+            self._zoom_start = event.pos()
+            from PyQt5.QtWidgets import QRubberBand
+            if not self._rubber_band:
+                self._rubber_band = QRubberBand(QRubberBand.Rectangle, self)
+            self._rubber_band.setGeometry(QRect(self._zoom_start, QSize()))
+            self._rubber_band.show()
+            event.accept()
+            return
+
         if event.button() == Qt.MiddleButton:
             self._panning = True
             self._pan_start = event.pos()
             self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+        elif event.button() == Qt.LeftButton:
+            item = self.itemAt(event.pos())
+            if item is None or isinstance(item, (GridItem, LanesItem)):
+                self._panning = True
+                self._pan_start = event.pos()
+                self.setCursor(Qt.ClosedHandCursor)
+                event.accept()
+            else:
+                super().mousePressEvent(event)
         else:
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._zoom_mode and self._rubber_band and (event.buttons() & Qt.LeftButton):
+            self._rubber_band.setGeometry(QRect(self._zoom_start, event.pos()).normalized())
+            event.accept()
+            return
+
         if self._panning:
             delta = event.pos() - self._pan_start
             self._pan_start = event.pos()
@@ -1221,13 +1249,27 @@ class Canvas2D(QGraphicsView):
                 self.horizontalScrollBar().value() - delta.x())
             self.verticalScrollBar().setValue(
                 self.verticalScrollBar().value() - delta.y())
+            event.accept()
         else:
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MiddleButton:
+        if self._zoom_mode and self._rubber_band:
+            self._rubber_band.hide()
+            rect = QRect(self._zoom_start, event.pos()).normalized()
+            if rect.width() > 5 and rect.height() > 5:
+                scene_rect = self.mapToScene(rect).boundingRect()
+                self.fitInView(scene_rect, Qt.KeepAspectRatio)
+            self._zoom_mode = False
+            self.setCursor(Qt.ArrowCursor)
+            self.signals.zoom_mode_changed.emit(False)
+            event.accept()
+            return
+
+        if self._panning:
             self._panning = False
             self.setCursor(Qt.ArrowCursor)
+            event.accept()
         else:
             super().mouseReleaseEvent(event)
 
@@ -5074,6 +5116,9 @@ class MainWindow(QMainWindow):
                                   lambda: self._canvas2d.zoom(1.2 ** -1)))
         _ctrl2d_lay.addWidget(_mb("🔍 适中", "自适应视野大小",
                                   self._canvas2d.fit_view))
+        self._zoom_rect_btn = _mb("🔎 框选放大", "拉框进行局部放大",
+                                  self._toggle_zoom_mode, checkable=True)
+        _ctrl2d_lay.addWidget(self._zoom_rect_btn)
         _ctrl2d_lay.addSpacing(16)
 
         _bg_lbl = QLabel("背景:")
@@ -5218,6 +5263,7 @@ class MainWindow(QMainWindow):
         self._signals.vehicle_changed.connect(self._on_modified)
         self._signals.sensor_selected.connect(self._on_sensor_selected)
         self._signals.sensor_deselected.connect(lambda: self._status.showMessage(""))
+        self._signals.zoom_mode_changed.connect(self._zoom_rect_btn.setChecked)
 
         # Also connect canvas2d sensor add from context-menu duplication
         self._signals.sensor_added.connect(self._on_sensor_added_rebuild)
@@ -5341,6 +5387,14 @@ class MainWindow(QMainWindow):
     # ── view controls ─────────────────────────────────────────
     def _fit_view(self):
         self._canvas2d.fit_view()
+
+    def _toggle_zoom_mode(self):
+        is_active = self._zoom_rect_btn.isChecked()
+        self._canvas2d._zoom_mode = is_active
+        if is_active:
+            self._canvas2d.setCursor(Qt.CrossCursor)
+        else:
+            self._canvas2d.setCursor(Qt.ArrowCursor)
 
     def _toggle_grid(self):
         self._scene_cfg.show_grid = not self._scene_cfg.show_grid
