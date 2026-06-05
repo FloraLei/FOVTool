@@ -2017,6 +2017,7 @@ class SensorListPanel(QWidget):
         self._list = QListWidget()
         self._list.setSelectionMode(QAbstractItemView.SingleSelection)
         self._list.itemSelectionChanged.connect(self._on_list_selection)
+        self._list.itemDoubleClicked.connect(self._rename_selected_item)
         layout.addWidget(self._list)
 
         # ── Bottom buttons ────────────────────────────────────
@@ -2027,7 +2028,9 @@ class SensorListPanel(QWidget):
         btn_dup.clicked.connect(self._duplicate_selected)
         btn_tog = QPushButton("◎ 切换")
         btn_tog.clicked.connect(self._toggle_selected)
-        for b in (btn_del, btn_dup, btn_tog):
+        btn_ren = QPushButton("✏ 重命名")
+        btn_ren.clicked.connect(self._rename_selected)
+        for b in (btn_del, btn_dup, btn_tog, btn_ren):
             b.setFixedHeight(28)
             btn_row.addWidget(b)
         layout.addLayout(btn_row)
@@ -2139,6 +2142,30 @@ class SensorListPanel(QWidget):
             sensor.enabled = not sensor.enabled
             self.signals.sensor_changed.emit(sid)
             self._refresh_item(sid)
+
+    def _rename_selected(self):
+        sid = self._selected_id()
+        if not sid:
+            return
+        sensor = next((s for s in self.scene_cfg.sensors if s.id == sid), None)
+        if sensor:
+            name, ok = QInputDialog.getText(self, "重命名传感器", "新传感器名称:",
+                                             text=sensor.name)
+            if ok and name.strip():
+                sensor.name = name.strip()
+                self._refresh_item(sid)
+                self.signals.sensor_changed.emit(sid)
+
+    def _rename_selected_item(self, item):
+        sid = item.data(Qt.UserRole)
+        sensor = next((s for s in self.scene_cfg.sensors if s.id == sid), None)
+        if sensor:
+            name, ok = QInputDialog.getText(self, "重命名传感器", "新传感器名称:",
+                                             text=sensor.name)
+            if ok and name.strip():
+                sensor.name = name.strip()
+                self._refresh_item(sid)
+                self.signals.sensor_changed.emit(sid)
 
     def _load_hw30(self):
         if self.scene_cfg.sensors:
