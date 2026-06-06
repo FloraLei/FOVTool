@@ -623,7 +623,8 @@ class SensorGraphicsItem(QGraphicsItemGroup):
         return super().itemChange(change, value)
 
     def hoverEnterEvent(self, event):
-        QApplication.setOverrideCursor(Qt.SizeAllCursor)
+        if self.flags() & QGraphicsItem.ItemIsMovable:
+            QApplication.setOverrideCursor(Qt.SizeAllCursor)
         super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event):
@@ -1013,6 +1014,7 @@ class Canvas2D(QGraphicsView):
         self._bg_dark = True       # True = dark, False = light
         self._zoom_mode = False
         self._rubber_band = None
+        self._fov_locked = False
 
         # View settings
         self.setRenderHint(QPainter.Antialiasing)
@@ -1088,9 +1090,15 @@ class Canvas2D(QGraphicsView):
         self._scene.addItem(item)
         self._sensor_items[sensor.id] = item
         item._label.setVisible(self.scene_cfg.show_labels)
+        item.setFlag(QGraphicsItem.ItemIsMovable, not self._fov_locked)
 
     def add_sensor(self, sensor: SensorConfig):
         self._add_sensor_item(sensor)
+
+    def set_fov_locked(self, locked: bool):
+        self._fov_locked = locked
+        for item in self._sensor_items.values():
+            item.setFlag(QGraphicsItem.ItemIsMovable, not locked)
 
     def _remove_item(self, sensor_id: str):
         item = self._sensor_items.pop(sensor_id, None)
@@ -5128,6 +5136,11 @@ class MainWindow(QMainWindow):
         self._bg_light_btn = _mb("☀ 白色背景", "切换为白色/浅色背景（适合打印导出）",
                                   self._on_bg_toggle, checkable=True)
         _ctrl2d_lay.addWidget(self._bg_light_btn)
+        _ctrl2d_lay.addSpacing(16)
+
+        self._lock_btn = _mb("🔓 视角解锁", "锁定后防止鼠标不小心拖动传感器位置",
+                              self._on_lock_toggle, checkable=True)
+        _ctrl2d_lay.addWidget(self._lock_btn)
 
         _ctrl2d_lay.addStretch()
         _wrap2d_lay.addWidget(_ctrl2d)
@@ -5292,6 +5305,16 @@ class MainWindow(QMainWindow):
         light = self._bg_light_btn.isChecked()
         self._canvas2d.set_dark_bg(not light)
         self._bg_light_btn.setText("🌙 暗色背景" if light else "☀ 白色背景")
+
+    def _on_lock_toggle(self):
+        locked = self._lock_btn.isChecked()
+        self._canvas2d.set_fov_locked(locked)
+        if locked:
+            self._lock_btn.setText("🔒 视角锁定")
+            self._lock_btn.setToolTip("当前已锁定传感器位置，再次点击解锁")
+        else:
+            self._lock_btn.setText("🔓 视角解锁")
+            self._lock_btn.setToolTip("锁定后防止鼠标不小心拖动传感器位置")
 
     def _on_modified(self, *_):
         self._modified = True
