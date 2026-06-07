@@ -1,6 +1,8 @@
 # PyInstaller
 build/
 dist/
+!dist/fov_tools_session.json  # 保留配置文件
+!dist/*.json                  # 保留所有JSON配置
 *.spec
 
 # Python cache

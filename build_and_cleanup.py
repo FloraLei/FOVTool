@@ -37,9 +37,6 @@ CLEANUP_PATTERNS = [
     '*_debug.spec',
     '*_v9*.spec',
     
-    # 会话文件
-    '*_session.json',
-    
     # 缓存
     '__pycache__',
     '*.pyc',
@@ -56,6 +53,8 @@ KEEP_FILES = {
     '.venv',
     'build',
     'dist',
+    # 传感器配置文件（重要！）
+    'fov_tools_session.json',
     # 指南文档
     'LANE_LINE_GUIDE.md',
     'QUICK_EDIT_GUIDE.md',
