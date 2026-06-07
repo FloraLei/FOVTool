@@ -289,6 +289,8 @@ class SensorConfig:
     opacity:      float = 0.30
     enabled:      bool  = True
     disp_hfov:    float = 0.0          # displayed FOV arc degrees; 0 = same as hfov
+    clip_by_vehicle: bool = True       # clip FOV by vehicle occlusion (new)
+    clip_range:   float = 0.0          # manual clip distance; 0=auto compute (new)
 
     def to_dict(self):
         return asdict(self)
@@ -1798,6 +1800,34 @@ class Canvas3D(QWidget):
                         "border-radius:3px;padding:0 8px;font-size:12px;font-weight:bold;}"
                         "QPushButton:hover{background:#5AA0E9;}")
 
+    def _clip_fov_by_vehicle(self, faces: list, sensor: SensorConfig) -> list:
+        """
+        Clip FOV cone faces by vehicle body occlusion.
+        Removes faces that are behind the vehicle (for rear-facing sensors).
+        """
+        v = self.scene_cfg.vehicle
+        clip_y = getattr(sensor, 'clip_range', 0.0)
+        
+        if clip_y > 0:
+            # Manual clip distance provided by user
+            clip_plane_y = sensor.y - clip_y
+        else:
+            # Auto-compute: clip at the back of the vehicle/trailer
+            clip_plane_y = -v.length - max(0, v.trailer_length)
+        
+        # Filter faces: keep only faces where at least one point is beyond clip_plane
+        clipped_faces = []
+        for face in faces:
+            keep_face = False
+            for pt in face:
+                if pt[1] > clip_plane_y:  # Y coordinate > clip plane
+                    keep_face = True
+                    break
+            if keep_face:
+                clipped_faces.append(face)
+        
+        return clipped_faces
+
     def _set_view_preset(self, idx: int):
         _, elev, azim, _ = self._vp_presets[idx]
         # Same preset clicked again → flip azimuth 180°
@@ -1900,6 +1930,14 @@ class Canvas3D(QWidget):
             faces = fov_cone_faces(sensor)
             if not faces:
                 continue
+            
+            # Apply FOV clipping by vehicle occlusion
+            if getattr(sensor, 'clip_by_vehicle', True):
+                faces = self._clip_fov_by_vehicle(faces, sensor)
+            
+            if not faces:
+                continue
+            
             hex_c = sensor.color.lstrip('#')
             rgb   = tuple(int(hex_c[i:i+2], 16) / 255 for i in (0, 2, 4))
             poly  = Poly3DCollection(faces, alpha=sensor.opacity * 0.85,
@@ -2398,6 +2436,13 @@ class SensorPropertiesPanel(QWidget):
         self._enabled = QCheckBox("启用")
         self._enabled.stateChanged.connect(self._on_enabled)
 
+        # New: FOV clipping parameters
+        self._clip_by_vehicle = QCheckBox("被车体遮挡时切割FOV")
+        self._clip_by_vehicle.stateChanged.connect(self._on_clip_changed)
+        
+        self._clip_range = spin(0, 200, 1, " m")
+        self._clip_range.valueChanged.connect(self._on_clip_changed)
+
         form.addRow("名称:",     self._name)
         form.addRow("类型:",     self._type)
         form.addRow("X 横向:",   self._x)
@@ -2413,6 +2458,8 @@ class SensorPropertiesPanel(QWidget):
         form.addRow("颜色:",     self._color_btn)
         form.addRow("显示FOV:",  self._dhfov)  # 0 = same as hfov
         form.addRow("",          self._enabled)
+        form.addRow("",          self._clip_by_vehicle)
+        form.addRow("手动切割距离:", self._clip_range)
 
         layout.addLayout(form)
         layout.addStretch()
@@ -2459,6 +2506,8 @@ class SensorPropertiesPanel(QWidget):
         self._opa.setValue(sensor.opacity)
         self._dhfov.setValue(getattr(sensor, 'disp_hfov', 0.0))
         self._enabled.setChecked(sensor.enabled)
+        self._clip_by_vehicle.setChecked(getattr(sensor, 'clip_by_vehicle', True))
+        self._clip_range.setValue(getattr(sensor, 'clip_range', 0.0))
         self._update_color_btn(sensor.color)
 
         self._updating = False
@@ -2474,7 +2523,8 @@ class SensorPropertiesPanel(QWidget):
     def _set_editable(self, on: bool):
         for w in (self._name, self._type, self._x, self._y, self._z,
                   self._ang, self._pitch, self._roll, self._hfov, self._vfov, self._rng,
-                  self._opa, self._dhfov, self._color_btn, self._enabled):
+                  self._opa, self._dhfov, self._color_btn, self._enabled,
+                  self._clip_by_vehicle, self._clip_range):
             w.setEnabled(on)
 
     def _on_moved(self, sensor_id: str):
@@ -2526,6 +2576,12 @@ class SensorPropertiesPanel(QWidget):
         if c.isValid():
             self._sensor.color = c.name()
             self._update_color_btn(self._sensor.color)
+            self.signals.sensor_changed.emit(self._sensor.id)
+
+    def _on_clip_changed(self):
+        if self._sensor and not self._updating:
+            self._sensor.clip_by_vehicle = self._clip_by_vehicle.isChecked()
+            self._sensor.clip_range = self._clip_range.value()
             self.signals.sensor_changed.emit(self._sensor.id)
 
     def _update_color_btn(self, hex_color: str):
