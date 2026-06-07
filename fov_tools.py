@@ -15,10 +15,39 @@ import os
 import warnings
 warnings.simplefilter("ignore")
 
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w")
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w")
+# Robust stream redirection to prevent crashes when stdout/stderr are invalid or closed in non-console mode
+if getattr(sys, 'frozen', False):
+    stdout_ok = False
+    try:
+        if sys.stdout is not None:
+            sys.stdout.write("")
+            sys.stdout.flush()
+            stdout_ok = True
+    except Exception:
+        pass
+
+    if not stdout_ok:
+        class SafeStream:
+            def write(self, data):
+                pass
+            def flush(self):
+                pass
+            def isatty(self):
+                return False
+            def fileno(self):
+                return -1
+
+        try:
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull_fd, 1)
+            os.dup2(devnull_fd, 2)
+        except Exception:
+            pass
+
+        sys.stdout = SafeStream()
+        sys.stderr = SafeStream()
+        sys.__stdout__ = SafeStream()
+        sys.__stderr__ = SafeStream()
 
 import json
 import math
@@ -250,8 +279,9 @@ class SensorConfig:
     x:            float = 0.0          # lateral  (right = +)  meters
     y:            float = 0.0          # longitudinal (fwd = +) meters
     z:            float = 0.5          # height meters
-    mount_angle:  float = 0.0          # degrees; 0=forward, CW positive
-    pitch:        float = 0.0          # elevation degrees; 0=horizontal, +up, -down
+    mount_angle:  float = 0.0          # 横摆角 Yaw (degrees); 0=forward, CW positive
+    pitch:        float = 0.0          # 俯仰角 Pitch (degrees); 0=horizontal, +up, -down
+    roll:         float = 0.0          # 滚转角 Roll (degrees); 0=horizontal, CW positive
     hfov:         float = 90.0         # horizontal FOV degrees
     vfov:         float = 60.0         # vertical FOV degrees
     range:        float = 60.0         # detection range meters
@@ -289,7 +319,7 @@ class LaneParamConfig:
     curvature_r:    float = 0.0        # 弯道半径 R (m, 0=直)
     left_lines:     int   = 1          # 左侧车道线数量
     right_lines:    int   = 1          # 右侧车道线数量
-    length:         float = 100.0      # 车道线长度 (m)
+    length:         float = 1000.0     # 车道线长度 (m)
     color_outer:    str   = "#FFFFFF"  # 外侧边界线颜色 (默认白色)
     color_inner:    str   = "#FFCC00"  # 内侧分界线/中心虚线颜色 (默认黄色)
 
@@ -458,16 +488,31 @@ def fov_cone_faces(sensor: SensorConfig, n_az: int = 24, n_el: int = 6):
     v2  = math.radians(sensor.vfov / 2)
 
     el0 = math.radians(getattr(sensor, 'pitch', 0.0))
+    roll0 = math.radians(getattr(sensor, 'roll', 0.0))
     azs = np.linspace(az0 - h2, az0 + h2, n_az)
     els = np.linspace(el0 - v2, el0 + v2, n_el)
     tip = np.array([sensor.x, sensor.y, sensor.z])
 
+    # If roll is non-zero, calculate optical axis vector for Rodrigues' rotation formula
+    if roll0 != 0:
+        ux = math.sin(az0) * math.cos(el0)
+        uy = math.cos(az0) * math.cos(el0)
+        uz = math.sin(el0)
+        u = np.array([ux, uy, uz])
+        cos_r = math.cos(roll0)
+        sin_r = math.sin(roll0)
+
     def ray(az, el):
-        return tip + sensor.range * np.array([
+        v = np.array([
             math.sin(az) * math.cos(el),   # X right
             math.cos(az) * math.cos(el),   # Y forward
             math.sin(el),                  # Z up
         ])
+        if roll0 != 0:
+            cross_uv = np.cross(u, v)
+            dot_uv = np.dot(u, v)
+            v = v * cos_r + cross_uv * sin_r + u * dot_uv * (1.0 - cos_r)
+        return tip + sensor.range * v
 
     faces = []
     for i in range(n_az - 1):
@@ -516,10 +561,11 @@ MARKER_RADIUS = 0.35   # meters – sensor marker circle radius
 class SensorGraphicsItem(QGraphicsItemGroup):
     """Compound graphics item: FOV arc + sensor marker + label."""
 
-    def __init__(self, sensor: SensorConfig, signals: AppSignals, parent=None):
+    def __init__(self, sensor: SensorConfig, signals: AppSignals, scene_cfg: SceneConfig = None, parent=None):
         super().__init__(parent)
         self.sensor  = sensor
         self.signals = signals
+        self.scene_cfg = scene_cfg
         self._moving = False
 
         self.setFlag(QGraphicsItem.ItemIsSelectable,          True)
@@ -645,6 +691,8 @@ class SensorGraphicsItem(QGraphicsItemGroup):
             new_s.id = str(uuid.uuid4())[:8]
             new_s.name += "_副本"
             new_s.x += 0.5
+            if self.scene_cfg is not None:
+                self.scene_cfg.sensors.append(new_s)
             self.signals.sensor_added.emit(new_s.id)
             # Store data on signal for retrieval
             self._dup_sensor = new_s
@@ -850,88 +898,119 @@ class LanesItem(QGraphicsItem):
         super().__init__(parent)
         self.scene_cfg = scene_cfg
         self.setZValue(0)  # Draw below sensor FOVs (Z=1) and vehicle (Z=5)
+        self._cache_key = None
+        self._cached_road_path = None
+        self._cached_left_lines = []   # list of (color, style, line_width, QPainterPath)
+        self._cached_right_lines = []  # list of (color, style, line_width, QPainterPath)
 
     def boundingRect(self):
-        return QRectF(-200, -600, 400, 1200)
+        return QRectF(-1000, -1000, 2000, 2000)
 
     def paint(self, painter, option, widget=None):
         lp = self.scene_cfg.lane_params
         if lp.left_lines <= 0 and lp.right_lines <= 0:
             return
 
-        y_start = -lp.length / 2.0
-        y_end = lp.length / 2.0
-        num_points = max(20, int(abs(y_end - y_start) / 2))
-        ys = np.linspace(y_start, y_end, num_points)
+        current_key = (
+            lp.curvature_r, lp.length, lp.lateral_offset, lp.lane_width,
+            lp.left_lines, lp.right_lines, lp.line_width,
+            lp.color_outer, lp.color_inner
+        )
 
-        # Helper to compute xs for a given base x
-        def get_xs(x_base):
-            c = 1.0 / (2.0 * lp.curvature_r) if lp.curvature_r != 0.0 else 0.0
-            return x_base + c * (ys - y_start) ** 2
+        if self._cache_key != current_key:
+            self._cache_key = current_key
+            self._cached_left_lines.clear()
+            self._cached_right_lines.clear()
 
-        # Compute outermost profiles for road background
-        if lp.left_lines > 0:
-            x_left_most = lp.lateral_offset - (lp.left_lines - 0.5) * lp.lane_width
-        else:
-            x_left_most = lp.lateral_offset - 0.5 * lp.lane_width
+            y_start = -lp.length / 2.0
+            y_end = lp.length / 2.0
+            num_points = max(20, int(abs(y_end - y_start) / 2))
+            s = np.linspace(y_start, y_end, num_points)
 
-        if lp.right_lines > 0:
-            x_right_most = lp.lateral_offset + (lp.right_lines - 0.5) * lp.lane_width
-        else:
-            x_right_most = lp.lateral_offset + 0.5 * lp.lane_width
+            def get_points(x_base):
+                R = lp.curvature_r
+                if R == 0.0:
+                    return np.full_like(s, x_base), s
+                phi = s / R
+                xs = R - (R - x_base) * np.cos(phi)
+                ys_curve = (R - x_base) * np.sin(phi)
+                return xs, ys_curve
 
-        xs_min = get_xs(x_left_most)
-        xs_max = get_xs(x_right_most)
+            # Outermost profiles for road background
+            if lp.left_lines > 0:
+                x_left_most = lp.lateral_offset - (lp.left_lines - 0.5) * lp.lane_width
+            else:
+                x_left_most = lp.lateral_offset - 0.5 * lp.lane_width
 
+            if lp.right_lines > 0:
+                x_right_most = lp.lateral_offset + (lp.right_lines - 0.5) * lp.lane_width
+            else:
+                x_right_most = lp.lateral_offset + 0.5 * lp.lane_width
+
+            xs_min, ys_min = get_points(x_left_most)
+            xs_max, ys_max = get_points(x_right_most)
+
+            # Rebuild road background path
+            road_path = QPainterPath()
+            road_path.moveTo(xs_min[0], -ys_min[0])
+            for i in range(1, len(s)):
+                road_path.lineTo(xs_min[i], -ys_min[i])
+            for i in range(len(s) - 1, -1, -1):
+                road_path.lineTo(xs_max[i], -ys_max[i])
+            road_path.closeSubpath()
+            self._cached_road_path = road_path
+
+            # Rebuild left lines
+            for idx in range(1, lp.left_lines + 1):
+                x_base = lp.lateral_offset - (idx - 0.5) * lp.lane_width
+                is_outer = (idx == lp.left_lines)
+                color = lp.color_outer if is_outer else lp.color_inner
+                style = Qt.SolidLine if is_outer else Qt.DashLine
+
+                path = QPainterPath()
+                xs, ys_lane = get_points(x_base)
+                path.moveTo(xs[0], -ys_lane[0])
+                for i in range(1, len(s)):
+                    path.lineTo(xs[i], -ys_lane[i])
+                self._cached_left_lines.append((color, style, lp.line_width, path))
+
+            # Rebuild right lines
+            for idx in range(1, lp.right_lines + 1):
+                x_base = lp.lateral_offset + (idx - 0.5) * lp.lane_width
+                is_outer = (idx == lp.right_lines)
+                color = lp.color_outer if is_outer else lp.color_inner
+                style = Qt.SolidLine if is_outer else Qt.DashLine
+
+                path = QPainterPath()
+                xs, ys_lane = get_points(x_base)
+                path.moveTo(xs[0], -ys_lane[0])
+                for i in range(1, len(s)):
+                    path.lineTo(xs[i], -ys_lane[i])
+                self._cached_right_lines.append((color, style, lp.line_width, path))
+
+        # ── DRAWING FROM CACHE ──
         # Draw dark road background surface (#21262D)
-        road_path = QPainterPath()
-        road_path.moveTo(xs_min[0], -ys[0])
-        for i in range(1, len(ys)):
-            road_path.lineTo(xs_min[i], -ys[i])
-        for i in range(len(ys) - 1, -1, -1):
-            road_path.lineTo(xs_max[i], -ys[i])
-        road_path.closeSubpath()
-
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(QColor("#21262D")))
-        painter.drawPath(road_path)
+        painter.drawPath(self._cached_road_path)
 
-        # Draw left lane lines
-        for idx in range(1, lp.left_lines + 1):
-            x_base = lp.lateral_offset - (idx - 0.5) * lp.lane_width
-            xs = get_xs(x_base)
+        # Reset brush so lane-line open paths are NOT filled
+        painter.setBrush(Qt.NoBrush)
 
-            is_outer = (idx == lp.left_lines)
-            color = lp.color_outer if is_outer else lp.color_inner
-            style = Qt.SolidLine if is_outer else Qt.DashLine
-
-            pen = QPen(QColor(color), lp.line_width, style)
+        # Draw left lines from cache
+        for color, style, l_width, path in self._cached_left_lines:
+            pen = QPen(QColor(color), l_width, style)
             pen.setCapStyle(Qt.RoundCap)
+            pen.setCosmetic(False)   # keep world-space width (scales with zoom)
             painter.setPen(pen)
-
-            path = QPainterPath()
-            path.moveTo(xs[0], -ys[0])
-            for i in range(1, len(ys)):
-                path.lineTo(xs[i], -ys[i])
             painter.drawPath(path)
 
-        # Draw right lane lines
-        for idx in range(1, lp.right_lines + 1):
-            x_base = lp.lateral_offset + (idx - 0.5) * lp.lane_width
-            xs = get_xs(x_base)
-
-            is_outer = (idx == lp.right_lines)
-            color = lp.color_outer if is_outer else lp.color_inner
-            style = Qt.SolidLine if is_outer else Qt.DashLine
-
-            pen = QPen(QColor(color), lp.line_width, style)
+        # Draw right lines from cache
+        for color, style, l_width, path in self._cached_right_lines:
+            pen = QPen(QColor(color), l_width, style)
             pen.setCapStyle(Qt.RoundCap)
+            pen.setCosmetic(False)
             painter.setPen(pen)
-
-            path = QPainterPath()
-            path.moveTo(xs[0], -ys[0])
-            for i in range(1, len(ys)):
-                path.lineTo(xs[i], -ys[i])
             painter.drawPath(path)
 
 
@@ -1086,7 +1165,7 @@ class Canvas2D(QGraphicsView):
         self._on_lane_changed()
 
     def _add_sensor_item(self, sensor: SensorConfig):
-        item = SensorGraphicsItem(sensor, self.signals)
+        item = SensorGraphicsItem(sensor, self.signals, self.scene_cfg)
         self._scene.addItem(item)
         self._sensor_items[sensor.id] = item
         item._label.setVisible(self.scene_cfg.show_labels)
@@ -1471,8 +1550,14 @@ class Canvas2D(QGraphicsView):
 
             # FOV spec
             fov_str = f"FOV: {s.range:.0f}m / {s.hfov:.0f}°"
+            if s.mount_angle != 0:
+                fov_str += f"  横摆:{s.mount_angle:+.0f}°"
             if s.vfov > 0:
                 fov_str += f"  V:{s.vfov:.0f}°"
+            if getattr(s, 'pitch', 0.0) != 0:
+                fov_str += f"  俯仰:{s.pitch:+.0f}°"
+            if getattr(s, 'roll', 0.0) != 0:
+                fov_str += f"  滚转:{s.roll:+.0f}°"
             ff = QFont("Microsoft YaHei", font_fov_pt)
             p.setFont(ff)
             fc = QColor(180, 180, 180, card_alpha)
@@ -1703,7 +1788,7 @@ class Canvas3D(QWidget):
         self._delayed_redraw()
 
     def _delayed_redraw(self, *_):
-        self._timer.start(300)
+        self._timer.start(500)
 
     # ── viewpoint preset with flip ────────────────────────────
     _VP_BTN_NORMAL  = ("QPushButton{background:#3A3A3A;border:1px solid #555;"
@@ -1893,8 +1978,13 @@ class ProfileManager:
             return
         data = self._profiles[index]['data']
         new_cfg = SceneConfig.from_dict(data)
-        self.scene_cfg.vehicle  = new_cfg.vehicle
-        self.scene_cfg.sensors  = new_cfg.sensors
+        self.scene_cfg.vehicle         = new_cfg.vehicle
+        self.scene_cfg.sensors         = new_cfg.sensors
+        self.scene_cfg.lane_params     = new_cfg.lane_params
+        self.scene_cfg.target_vehicles = new_cfg.target_vehicles
+        self.scene_cfg.show_grid       = new_cfg.show_grid
+        self.scene_cfg.show_labels     = new_cfg.show_labels
+        self.scene_cfg.show_overlap    = new_cfg.show_overlap
         self._active = index
 
     def rename(self, index: int, new_name: str):
@@ -2288,15 +2378,16 @@ class SensorPropertiesPanel(QWidget):
         self._x    = spin(-50,  50, 2, " m")
         self._y    = spin(-50,  50, 2, " m")
         self._z    = spin(  0,  10, 2, " m")
-        self._ang  = spin(-180, 360, 1, "°")
+        self._ang  = spin(-180, 180, 1, "°")
         self._pitch= spin( -90,  90, 1, "°")
+        self._roll = spin(-180, 180, 1, "°")
         self._hfov = spin(  1, 360, 1, "°")
         self._vfov = spin(  1, 180, 1, "°")
         self._rng  = spin(  1, 800, 0, " m")
         self._opa  = spin(  0,   1, 2, "")
         self._dhfov= spin(  0, 360, 1, "°")  # disp_hfov
 
-        for w in (self._x, self._y, self._z, self._ang, self._pitch,
+        for w in (self._x, self._y, self._z, self._ang, self._pitch, self._roll,
                   self._hfov, self._vfov, self._rng, self._opa, self._dhfov):
             w.valueChanged.connect(self._on_spinbox)
 
@@ -2312,8 +2403,9 @@ class SensorPropertiesPanel(QWidget):
         form.addRow("X 横向:",   self._x)
         form.addRow("Y 纵向:",   self._y)
         form.addRow("Z 高度:",   self._z)
-        form.addRow("安装角度:", self._ang)
+        form.addRow("横摆角:",   self._ang)
         form.addRow("俯仰角:",   self._pitch)
+        form.addRow("滚转角:",   self._roll)
         form.addRow("水平FOV:",  self._hfov)
         form.addRow("垂直FOV:",  self._vfov)
         form.addRow("探测距离:", self._rng)
@@ -2360,6 +2452,7 @@ class SensorPropertiesPanel(QWidget):
         self._z.setValue(sensor.z)
         self._ang.setValue(sensor.mount_angle)
         self._pitch.setValue(getattr(sensor, 'pitch', 0.0))
+        self._roll.setValue(getattr(sensor, 'roll', 0.0))
         self._hfov.setValue(sensor.hfov)
         self._vfov.setValue(sensor.vfov)
         self._rng.setValue(sensor.range)
@@ -2380,7 +2473,7 @@ class SensorPropertiesPanel(QWidget):
 
     def _set_editable(self, on: bool):
         for w in (self._name, self._type, self._x, self._y, self._z,
-                  self._ang, self._pitch, self._hfov, self._vfov, self._rng,
+                  self._ang, self._pitch, self._roll, self._hfov, self._vfov, self._rng,
                   self._opa, self._dhfov, self._color_btn, self._enabled):
             w.setEnabled(on)
 
@@ -2412,6 +2505,7 @@ class SensorPropertiesPanel(QWidget):
         self._sensor.z           = self._z.value()
         self._sensor.mount_angle = self._ang.value()
         self._sensor.pitch       = self._pitch.value()
+        self._sensor.roll        = self._roll.value()
         self._sensor.hfov        = self._hfov.value()
         self._sensor.vfov        = self._vfov.value()
         self._sensor.range       = self._rng.value()
@@ -2461,6 +2555,7 @@ class SensorPropertiesPanel(QWidget):
         new_s.name += "_镜像"
         new_s.x     = -self._sensor.x
         new_s.mount_angle = -self._sensor.mount_angle
+        new_s.roll = -getattr(self._sensor, 'roll', 0.0)
         self.scene_cfg.sensors.append(new_s)
         self.signals.sensor_added.emit(new_s.id)
 
@@ -2981,15 +3076,15 @@ def compute_ground_intersections(s: 'SensorConfig'):
 class SensorGroundTablePanel(QWidget):
     """传感器地面落点距离表。
 
-    列：品牌色 / 名称 / X / Y / Z / pitch / vFOV / range
-           / 下沿落地 / 中心落地 / 上沿落地 / 探测圆弧落地 / 最近点
+    列：品牌色 / 名称 / 启用 / X / Y / Z / 横摆角 / 俯仰角 / 滚转角 / vFOV / range
+           / 下沿落地 / 中心落地 / 上沿落地 / 探测圆弧落地 / 最近点 / 最近点 Y
     跟随传感器位置/参数变化实时更新。
     """
 
     COLUMNS = [
         "", "名称", "启用",
         "X(m)", "Y(m)", "Z(m)",
-        "pitch°", "vFOV°", "range(m)",
+        "横摆角°", "俯仰角°", "滚转角°", "vFOV°", "range(m)",
         "下沿地距(m)", "中心地距(m)",
         "上沿地距(m)", "圆弧地距(m)",
         "最近点(m)", "最近点 Y(m)",
@@ -3000,6 +3095,9 @@ class SensorGroundTablePanel(QWidget):
         self.scene_cfg = scene_cfg
         self.signals = signals
 
+        self._needs_rebuild = True
+        self._updated_sensor_ids = set()
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
@@ -3008,7 +3106,7 @@ class SensorGroundTablePanel(QWidget):
         hint = QLabel(
             "传感器 FOV 下/中/上沿与地面 z=0 交点的水平距离 x = z / tan(|仰角|)。"
             "表格随传感器位置/姿态变动自动更新；"
-            "“—” 表示该射线不交地面。"
+            "“—” 表示该射线不交地面；本表计算暂不考虑滚转角。"
         )
         hint.setStyleSheet("color:#9DB1C0; font-size:10px; padding:2px;")
         hint.setWordWrap(True)
@@ -3037,15 +3135,26 @@ class SensorGroundTablePanel(QWidget):
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.refresh)
 
-        for sig in (signals.sensor_changed, signals.sensor_moved,
-                    signals.sensor_added,   signals.sensor_removed,
+        # 结构变化信号 -> 触发全表重建
+        for sig in (signals.sensor_added, signals.sensor_removed,
                     signals.vehicle_changed, signals.scene_rebuilt):
-            sig.connect(self._delayed_refresh)
+            sig.connect(self._on_structure_changed)
+
+        # 单个传感器数值/位置变化 -> 仅刷新对应行
+        for sig in (signals.sensor_changed, signals.sensor_moved):
+            sig.connect(self._on_sensor_updated)
+
         signals.sensor_selected.connect(self._on_external_select)
 
         QTimer.singleShot(200, self.refresh)
 
-    def _delayed_refresh(self, *_):
+    def _on_structure_changed(self, *_):
+        self._needs_rebuild = True
+        self._timer.start(120)
+
+    def _on_sensor_updated(self, sid: str, *_):
+        if not self._needs_rebuild:
+            self._updated_sensor_ids.add(sid)
         self._timer.start(120)
 
     @staticmethod
@@ -3055,6 +3164,16 @@ class SensorGroundTablePanel(QWidget):
         return f"{v:.{prec}f}{suffix}"
 
     def refresh(self):
+        if self._needs_rebuild:
+            self._rebuild_table()
+            self._needs_rebuild = False
+            self._updated_sensor_ids.clear()
+        elif self._updated_sensor_ids:
+            for sid in list(self._updated_sensor_ids):
+                self._refresh_sensor_row(sid)
+            self._updated_sensor_ids.clear()
+
+    def _rebuild_table(self):
         sensors = list(self.scene_cfg.sensors)
         # 记住当前选中传感器，刷新后重新选上
         sel_id = None
@@ -3066,47 +3185,7 @@ class SensorGroundTablePanel(QWidget):
         self._table.blockSignals(True)
         self._table.setRowCount(len(sensors))
         for r, s in enumerate(sensors):
-            info = compute_ground_intersections(s)
-
-            # 0: 颜色色块
-            color_item = QTableWidgetItem("")
-            color_item.setBackground(QColor(s.color))
-            color_item.setFlags(color_item.flags() & ~Qt.ItemIsEditable)
-            self._table.setItem(r, 0, color_item)
-
-            def _mk(text, align=Qt.AlignCenter, tip=None):
-                it = QTableWidgetItem(text)
-                it.setTextAlignment(align)
-                if tip:
-                    it.setToolTip(tip)
-                if not s.enabled:
-                    it.setForeground(QBrush(QColor("#666666")))
-                return it
-
-            name_item = _mk(s.name, Qt.AlignLeft | Qt.AlignVCenter)
-            name_item.setData(Qt.UserRole, s.id)
-            self._table.setItem(r, 1, name_item)
-            self._table.setItem(r, 2, _mk("✓" if s.enabled else "✗"))
-            self._table.setItem(r, 3, _mk(self._fmt(s.x, 2)))
-            self._table.setItem(r, 4, _mk(self._fmt(s.y, 2)))
-            self._table.setItem(r, 5, _mk(self._fmt(s.z, 2)))
-            self._table.setItem(r, 6, _mk(self._fmt(getattr(s, 'pitch', 0.0), 1)))
-            self._table.setItem(r, 7, _mk(self._fmt(s.vfov, 1)))
-            self._table.setItem(r, 8, _mk(self._fmt(s.range, 1)))
-            self._table.setItem(r, 9, _mk(self._fmt(info['lower'], 1),
-                                          tip="FOV 下沿射线交地点的水平距离 x = z/tan|下沿仰角|"))
-            self._table.setItem(r, 10, _mk(self._fmt(info['center'], 1),
-                                          tip="FOV 中心线交地点的水平距离 x = z/tan|pitch|"))
-            self._table.setItem(r, 11, _mk(self._fmt(info['upper'], 1),
-                                          tip="FOV 上沿射线交地点的水平距离"))
-            self._table.setItem(r, 12, _mk(self._fmt(info['range_'], 1),
-                                          tip="探测圆弧交地点的水平距离 √(range² − z²)"))
-            nearest_item = _mk(self._fmt(info['nearest'], 1))
-            nearest_item.setForeground(QBrush(QColor("#FFD54F"))
-                                       if (info['nearest'] is not None and s.enabled)
-                                       else QBrush(QColor("#666666")))
-            self._table.setItem(r, 13, nearest_item)
-            self._table.setItem(r, 14, _mk(self._fmt(info['ground_y'], 1)))
+            self._populate_row(r, s)
 
         # 恢复选中行
         if sel_id is not None:
@@ -3118,6 +3197,69 @@ class SensorGroundTablePanel(QWidget):
         self._table.blockSignals(False)
         self._table.resizeColumnsToContents()
         self._table.setColumnWidth(0, 18)
+
+    def _refresh_sensor_row(self, sid: str):
+        s = next((x for x in self.scene_cfg.sensors if x.id == sid), None)
+        if not s:
+            return
+        r = self._find_row_by_id(sid)
+        if r < 0:
+            return
+        self._table.blockSignals(True)
+        self._populate_row(r, s)
+        self._table.blockSignals(False)
+
+    def _find_row_by_id(self, sid: str) -> int:
+        for r in range(self._table.rowCount()):
+            name_item = self._table.item(r, 1)
+            if name_item and name_item.data(Qt.UserRole) == sid:
+                return r
+        return -1
+
+    def _populate_row(self, r: int, s: SensorConfig):
+        info = compute_ground_intersections(s)
+
+        # 0: 颜色色块
+        color_item = QTableWidgetItem("")
+        color_item.setBackground(QColor(s.color))
+        color_item.setFlags(color_item.flags() & ~Qt.ItemIsEditable)
+        self._table.setItem(r, 0, color_item)
+
+        def _mk(text, align=Qt.AlignCenter, tip=None):
+            it = QTableWidgetItem(text)
+            it.setTextAlignment(align)
+            if tip:
+                it.setToolTip(tip)
+            if not s.enabled:
+                it.setForeground(QBrush(QColor("#666666")))
+            return it
+
+        name_item = _mk(s.name, Qt.AlignLeft | Qt.AlignVCenter)
+        name_item.setData(Qt.UserRole, s.id)
+        self._table.setItem(r, 1, name_item)
+        self._table.setItem(r, 2, _mk("✓" if s.enabled else "✗"))
+        self._table.setItem(r, 3, _mk(self._fmt(s.x, 2)))
+        self._table.setItem(r, 4, _mk(self._fmt(s.y, 2)))
+        self._table.setItem(r, 5, _mk(self._fmt(s.z, 2)))
+        self._table.setItem(r, 6, _mk(self._fmt(s.mount_angle, 1)))
+        self._table.setItem(r, 7, _mk(self._fmt(s.pitch, 1)))
+        self._table.setItem(r, 8, _mk(self._fmt(s.roll, 1)))
+        self._table.setItem(r, 9, _mk(self._fmt(s.vfov, 1)))
+        self._table.setItem(r, 10, _mk(self._fmt(s.range, 1)))
+        self._table.setItem(r, 11, _mk(self._fmt(info['lower'], 1),
+                                      tip="FOV 下沿射线交地点的水平距离 x = z/tan|下沿仰角|"))
+        self._table.setItem(r, 12, _mk(self._fmt(info['center'], 1),
+                                      tip="FOV 中心线交地点的水平距离 x = z/tan|pitch|"))
+        self._table.setItem(r, 13, _mk(self._fmt(info['upper'], 1),
+                                      tip="FOV 上沿射线交地点的水平距离"))
+        self._table.setItem(r, 14, _mk(self._fmt(info['range_'], 1),
+                                      tip="探测圆弧交地点的水平距离 √(range² − z²)"))
+        nearest_item = _mk(self._fmt(info['nearest'], 1))
+        nearest_item.setForeground(QBrush(QColor("#FFD54F"))
+                                   if (info['nearest'] is not None and s.enabled)
+                                   else QBrush(QColor("#666666")))
+        self._table.setItem(r, 15, nearest_item)
+        self._table.setItem(r, 16, _mk(self._fmt(info['ground_y'], 1)))
 
     def _on_row_selected(self):
         items = self._table.selectedItems()
@@ -3194,6 +3336,11 @@ class CoverageDialog(QWidget):
         ctrl.addWidget(self._stats_label)
         ctrl.addStretch()
         layout.addLayout(ctrl)
+
+        # 提示：暂不考虑滚转角
+        disclaimer = QLabel("注：本覆盖率分析仅计算2D水平面投影，暂未计算滚转角(Roll)影响。")
+        disclaimer.setStyleSheet("color: #888888; font-size: 10px; margin-left: 2px;")
+        layout.addWidget(disclaimer)
 
         self.fig = Figure(facecolor="#1E1E1E")
         self.canvas = FigureCanvas(self.fig)
@@ -3383,7 +3530,7 @@ class CanvasSideView(QWidget):
         covered_pct   = 100.0 * covered_cells / max(total_cells, 1)
         self._stats_lbl.setText(
             f"  覆盖 {covered_pct:.1f}%   |   盲区 {blind_pct:.1f}%   "
-            f"|   分辨率 {res:.1f} m  "
+            f"|   分辨率 {res:.1f} m  (注: 暂不考虑滚转角)  "
         )
 
         # ── Draw ───────────────────────────────────────────────
@@ -3671,6 +3818,8 @@ class SensorLegendWidget(QWidget):
             fov_str += f"  V:{s.vfov:.0f}°"
         if s.pitch != 0:
             fov_str += f"  俯仰:{s.pitch:+.0f}°"
+        if getattr(s, 'roll', 0.0) != 0:
+            fov_str += f"  滚转:{s.roll:+.0f}°"
         fov_lbl = QLabel(fov_str)
         fov_lbl.setStyleSheet(
             "color: #aaaaaa; background: transparent; border: none; font-size: 8pt;")
@@ -4857,11 +5006,16 @@ def export_diagram_hq(scene_cfg: 'SceneConfig', path: str,
         if lp.left_lines > 0 or lp.right_lines > 0:
             y_start = -lp.length / 2.0
             y_end = lp.length / 2.0
-            ys = np.linspace(y_start, y_end, 100)
+            s = np.linspace(y_start, y_end, 100)
 
-            def get_xs(x_base):
-                c = 1.0 / (2.0 * lp.curvature_r) if lp.curvature_r != 0.0 else 0.0
-                return x_base + c * (ys - y_start) ** 2
+            def get_points(x_base):
+                R = lp.curvature_r
+                if R == 0.0:
+                    return np.full_like(s, x_base), s
+                phi = s / R
+                xs = R - (R - x_base) * np.cos(phi)
+                ys_curve = (R - x_base) * np.sin(phi)
+                return xs, ys_curve
 
             if lp.left_lines > 0:
                 x_left_most = lp.lateral_offset - (lp.left_lines - 0.5) * lp.lane_width
@@ -4873,31 +5027,31 @@ def export_diagram_hq(scene_cfg: 'SceneConfig', path: str,
             else:
                 x_right_most = lp.lateral_offset + 0.5 * lp.lane_width
 
-            xs_min = get_xs(x_left_most)
-            xs_max = get_xs(x_right_most)
+            xs_min, ys_min = get_points(x_left_most)
+            xs_max, ys_max = get_points(x_right_most)
 
             # Draw road background surface
-            poly_x = np.concatenate([ys, ys[::-1]])
+            poly_x = np.concatenate([ys_min, ys_max[::-1]])
             poly_y = np.concatenate([xs_min, xs_max[::-1]])
             ax.fill(poly_x, poly_y, color="#21262D", zorder=1)
 
-            # Left lines
+            # Draw left lines
             for idx in range(1, lp.left_lines + 1):
                 x_base = lp.lateral_offset - (idx - 0.5) * lp.lane_width
-                xs = get_xs(x_base)
+                xs, ys_lane = get_points(x_base)
                 is_outer = (idx == lp.left_lines)
                 color = lp.color_outer if is_outer else lp.color_inner
                 style = 'solid' if is_outer else 'dashed'
-                ax.plot(ys, xs, color=color, linestyle=style, linewidth=1.5, zorder=2)
+                ax.plot(ys_lane, xs, color=color, linestyle=style, linewidth=1.5, zorder=2)
 
-            # Right lines
+            # Draw right lines
             for idx in range(1, lp.right_lines + 1):
                 x_base = lp.lateral_offset + (idx - 0.5) * lp.lane_width
-                xs = get_xs(x_base)
+                xs, ys_lane = get_points(x_base)
                 is_outer = (idx == lp.right_lines)
                 color = lp.color_outer if is_outer else lp.color_inner
                 style = 'solid' if is_outer else 'dashed'
-                ax.plot(ys, xs, color=color, linestyle=style, linewidth=1.5, zorder=2)
+                ax.plot(ys_lane, xs, color=color, linestyle=style, linewidth=1.5, zorder=2)
 
     # ── Target Vehicles ──
     if export_target:
@@ -5035,8 +5189,14 @@ def export_diagram_hq(scene_cfg: 'SceneConfig', path: str,
                 fov_str = f"FOV: {s.range:.0f}m / {s.hfov:.0f}°"
                 if getattr(s, 'disp_hfov', 0.0) > 0:
                     fov_str += f" (显示:{s.disp_hfov:.0f}°)"
+                if s.mount_angle != 0:
+                    fov_str += f"  横摆:{s.mount_angle:+.0f}°"
                 if s.vfov > 0:
                     fov_str += f"  V:{s.vfov:.0f}°"
+                if getattr(s, 'pitch', 0.0) != 0:
+                    fov_str += f"  俯仰:{s.pitch:+.0f}°"
+                if getattr(s, 'roll', 0.0) != 0:
+                    fov_str += f"  滚转:{s.roll:+.0f}°"
                 ax_leg.text(
                     0.12, y_mid - card_h * 0.15,
                     fov_str,
@@ -5052,6 +5212,23 @@ def export_diagram_hq(scene_cfg: 'SceneConfig', path: str,
     plt.close(fig)
 
 
+def get_session_file_path():
+    try:
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(base_dir, "fov_tools_session.json")
+        # Try writing to verify access
+        test_path = os.path.join(base_dir, ".test_write")
+        with open(test_path, 'w') as f:
+            f.write("1")
+        os.remove(test_path)
+        return path
+    except Exception:
+        return os.path.expanduser("~/fov_tools_session.json")
+
+
 # ══════════════════════════════════════════════════════════════
 #  MAIN WINDOW
 # ══════════════════════════════════════════════════════════════
@@ -5061,12 +5238,35 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.resize(1400, 860)
 
-        self._scene_cfg  = SceneConfig.hw30()
+        # Attempt to load autosaved session configuration
+        session_path = get_session_file_path()
+        self._loaded_session = False
+        self._scene_cfg = None
+        self._file_path = None
+
+        if os.path.exists(session_path):
+            try:
+                with open(session_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                self._scene_cfg = SceneConfig.from_dict(data)
+                self._profile_mgr = ProfileManager(self._scene_cfg)
+                if 'profiles' in data and isinstance(data['profiles'], list):
+                    self._profile_mgr.from_list(data['profiles'])
+                self._file_path = data.get('last_file_path')
+                self._loaded_session = True
+                # Automatically upgrade old short lane length to 1000m to cover zoomed-out sensor views
+                if self._scene_cfg.lane_params and self._scene_cfg.lane_params.length < 1000.0:
+                    self._scene_cfg.lane_params.length = 1000.0
+            except Exception as e:
+                print(f"Failed to load autosaved session: {e}")
+
+        if not self._scene_cfg:
+            self._scene_cfg = SceneConfig.hw30()
+            self._profile_mgr = ProfileManager(self._scene_cfg)
+
         self._signals    = AppSignals()
-        self._file_path  = None
         self._modified   = False
         self._coverage_dlg = None
-        self._profile_mgr = ProfileManager(self._scene_cfg)
 
         # ── Central tab widget ────────────────────────────────
         self._tabs = QTabWidget()
@@ -5090,17 +5290,17 @@ class MainWindow(QMainWindow):
         _ctrl2d_lay.setSpacing(4)
 
         _sep_lbl = QLabel("旋转:")
-        _sep_lbl.setStyleSheet("color:#AAAAAA; font-size:11px;")
+        _sep_lbl.setStyleSheet("color:#AAAAAA; font-size:13px;")
         _ctrl2d_lay.addWidget(_sep_lbl)
 
         def _mb(text, tip, fn, checkable=False):
             b = QPushButton(text)
             b.setToolTip(tip)
-            b.setFixedHeight(24)
+            b.setFixedHeight(28)
             b.setCheckable(checkable)
             b.setStyleSheet(
                 "QPushButton{background:#3A3A3A;border:1px solid #555;"
-                "border-radius:3px;padding:0 8px;font-size:11px;}"
+                "border-radius:3px;padding:0 10px;font-size:13px;}"
                 "QPushButton:hover{background:#505050;}"
                 "QPushButton:pressed,QPushButton:checked{background:#4A90D9;border-color:#4A90D9;}"
             )
@@ -5116,7 +5316,7 @@ class MainWindow(QMainWindow):
         _ctrl2d_lay.addSpacing(16)
 
         _zoom_lbl = QLabel("缩放:")
-        _zoom_lbl.setStyleSheet("color:#AAAAAA; font-size:11px;")
+        _zoom_lbl.setStyleSheet("color:#AAAAAA; font-size:13px;")
         _ctrl2d_lay.addWidget(_zoom_lbl)
         _ctrl2d_lay.addWidget(_mb("➕ 放大", "放大视图",
                                   lambda: self._canvas2d.zoom(1.2)))
@@ -5130,7 +5330,7 @@ class MainWindow(QMainWindow):
         _ctrl2d_lay.addSpacing(16)
 
         _bg_lbl = QLabel("背景:")
-        _bg_lbl.setStyleSheet("color:#AAAAAA; font-size:11px;")
+        _bg_lbl.setStyleSheet("color:#AAAAAA; font-size:13px;")
         _ctrl2d_lay.addWidget(_bg_lbl)
 
         self._bg_light_btn = _mb("☀ 白色背景", "切换为白色/浅色背景（适合打印导出）",
@@ -5266,7 +5466,11 @@ class MainWindow(QMainWindow):
         # ── Status bar ────────────────────────────────────────
         self._status = QStatusBar()
         self.setStatusBar(self._status)
-        self._status.showMessage(f"已载入 HW 3.0 预设 — {len(self._scene_cfg.sensors)} 个传感器")
+        if self._loaded_session:
+            self._status.showMessage(f"已恢复上次的会话状态 — {len(self._scene_cfg.sensors)} 个传感器")
+            self._update_title()
+        else:
+            self._status.showMessage(f"已载入 HW 3.0 预设 — {len(self._scene_cfg.sensors)} 个传感器")
 
         # Connect signals for status
         self._signals.sensor_added.connect(self._on_modified)
@@ -5274,6 +5478,10 @@ class MainWindow(QMainWindow):
         self._signals.sensor_changed.connect(self._on_modified)
         self._signals.sensor_moved.connect(self._on_modified)
         self._signals.vehicle_changed.connect(self._on_modified)
+        self._signals.lane_changed.connect(self._on_modified)
+        self._signals.target_vehicle_added.connect(self._on_modified)
+        self._signals.target_vehicle_removed.connect(self._on_modified)
+        self._signals.target_vehicle_changed.connect(self._on_modified)
         self._signals.sensor_selected.connect(self._on_sensor_selected)
         self._signals.sensor_deselected.connect(lambda: self._status.showMessage(""))
         self._signals.zoom_mode_changed.connect(self._zoom_rect_btn.setChecked)
@@ -5299,6 +5507,7 @@ class MainWindow(QMainWindow):
         self._status.showMessage(f"已切换到方案「{name}」— {n} 个传感器", 4000)
         self._modified = True
         self._update_title()
+        self._auto_save()
 
     # ── slot: 2D background toggle ────────────────────────────
     def _on_bg_toggle(self):
@@ -5316,11 +5525,26 @@ class MainWindow(QMainWindow):
             self._lock_btn.setText("🔓 视角解锁")
             self._lock_btn.setToolTip("锁定后防止鼠标不小心拖动传感器位置")
 
+    def _auto_save(self):
+        try:
+            path = get_session_file_path()
+            data = self._scene_cfg.to_dict()
+            profiles_list = self._profile_mgr.to_list()
+            if profiles_list:
+                data['profiles'] = profiles_list
+            if self._file_path:
+                data['last_file_path'] = self._file_path
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Auto-save failed: {e}")
+
     def _on_modified(self, *_):
         self._modified = True
         self._update_title()
         n = len(self._scene_cfg.sensors)
         self._status.showMessage(f"{n} 个传感器")
+        self._auto_save()
 
     def _on_sensor_selected(self, sensor_id: str):
         sensor = next((s for s in self._scene_cfg.sensors if s.id == sensor_id), None)
@@ -5349,6 +5573,7 @@ class MainWindow(QMainWindow):
         self._modified  = False
         self._signals.scene_rebuilt.emit()
         self._update_title()
+        self._auto_save()
 
     def _file_open(self):
         path, _ = QFileDialog.getOpenFileName(self, "打开配置", "",
@@ -5359,9 +5584,13 @@ class MainWindow(QMainWindow):
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             new_cfg = SceneConfig.from_dict(data)
-            self._scene_cfg.vehicle  = new_cfg.vehicle
-            self._scene_cfg.sensors  = new_cfg.sensors
-            self._scene_cfg.show_grid= new_cfg.show_grid
+            self._scene_cfg.vehicle         = new_cfg.vehicle
+            self._scene_cfg.sensors         = new_cfg.sensors
+            self._scene_cfg.lane_params     = new_cfg.lane_params
+            self._scene_cfg.target_vehicles = new_cfg.target_vehicles
+            self._scene_cfg.show_grid       = new_cfg.show_grid
+            self._scene_cfg.show_labels     = new_cfg.show_labels
+            self._scene_cfg.show_overlap    = new_cfg.show_overlap
             # Restore profiles if present
             if 'profiles' in data and isinstance(data['profiles'], list):
                 self._profile_mgr.from_list(data['profiles'])
@@ -5373,6 +5602,7 @@ class MainWindow(QMainWindow):
             self._modified  = False
             self._signals.scene_rebuilt.emit()
             self._update_title()
+            self._auto_save()
             QTimer.singleShot(100, self._canvas2d.fit_view)
         except Exception as e:
             QMessageBox.critical(self, "错误", f"打开失败:\n{e}")
@@ -5404,6 +5634,7 @@ class MainWindow(QMainWindow):
             self._modified  = False
             self._update_title()
             self._status.showMessage(f"已保存: {path}", 3000)
+            self._auto_save()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存失败:\n{e}")
 
@@ -5558,6 +5789,16 @@ class MainWindow(QMainWindow):
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 def main():
+    import traceback
+    def crash_handler(etype, value, tb):
+        try:
+            with open("app_crash.txt", "w", encoding="utf-8") as f:
+                traceback.print_exception(etype, value, tb, file=f)
+        except Exception:
+            pass
+        sys.__excepthook__(etype, value, tb)
+    sys.excepthook = crash_handler
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
