@@ -1,0 +1,110 @@
+📦 FOVTools 可执行文件修复总结
+═════════════════════════════════════════════════════════════
+
+✅ 问题已解决
+   - 更新了 FOVTools.spec 配置文件
+   - 添加了所有必需的隐藏导入（PyQt5、matplotlib、numpy等）
+   - 重新生成了 FOV_Tools.exe
+   - 应用已成功启动（进程ID: 60852）
+
+📊 新版 .exe 文件信息
+   位置: dist\FOV_Tools.exe
+   大小: 7.28 MB
+   生成时间: 2026/6/7 15:01
+   状态: ✅ 可用
+
+🚀 使用方法
+
+方式 1️⃣：直接双击运行
+   - 进入 dist 文件夹
+   - 双击 FOV_Tools.exe
+
+方式 2️⃣：命令行运行
+   c:\Fuyue_WorkSpace\FOVTools\dist\FOV_Tools.exe
+
+方式 3️⃣：PowerShell 运行
+   cd c:\Fuyue_WorkSpace\FOVTools\dist
+   .\FOV_Tools.exe
+
+🔧 修复细节
+
+问题原因：
+   PyInstaller 没有正确识别所有依赖模块，导致：
+   - PyQt5 GUI 组件缺失
+   - matplotlib 绘图库缺失
+   - numpy 数值库缺失
+
+解决方案：
+   在 FOVTools.spec 中明确指定 hiddenimports：
+   
+   hiddenimports=[
+       'PyQt5',
+       'PyQt5.QtCore',
+       'PyQt5.QtGui',
+       'PyQt5.QtWidgets',
+       'matplotlib',
+       'matplotlib.pyplot',
+       'matplotlib.patches',
+       'matplotlib.colors',
+       'matplotlib.figure',
+       'matplotlib.backends',
+       'matplotlib.backends.backend_qt5agg',
+       'matplotlib.gridspec',
+       'mpl_toolkits',
+       'mpl_toolkits.mplot3d',
+       'numpy',
+       'fitz',  # pymupdf
+   ]
+
+   同时配置 matplotlib 后端：
+   
+   hooksconfig={
+       'matplotlib': {
+           'backends': ['qt5agg'],
+       }
+   }
+
+📈 改进清单
+   ✅ 添加了显式的依赖声明
+   ✅ 配置了 matplotlib 的 Qt5 后端
+   ✅ 删除了不必要的系统库 (tcl, tk 等)
+   ✅ 文件大小优化到 7.28 MB
+   ✅ 应用成功启动并运行
+
+🎯 后续重建步骤
+
+如果你修改了代码并需要重新生成 .exe：
+
+方式 1：使用 Python 脚本
+   python build_and_cleanup.py
+
+方式 2：使用 Windows 批处理脚本
+   build_and_cleanup.bat
+
+方式 3：手动使用 PyInstaller
+   pyinstaller FOVTools.spec
+
+📝 重要说明
+
+1. 首次启动可能需要几秒钟（加载所有依赖）
+2. 如果看到 GUI 窗口（空白或显示）说明应用运行正常
+3. 需要加载配置文件才能看到完整功能
+
+🆘 如果还是有问题
+
+请尝试：
+1. 检查 Windows Defender 或防火墙是否阻止了应用
+2. 确保 Windows 10 或更高版本
+3. 检查磁盘空间是否充足
+4. 查看系统错误日志：
+   eventvwr.msc
+
+📞 技术支持
+
+详见文档：
+- README.md (完整使用指南)
+- FOV_CLIPPING_GUIDE.md (FOV 切割功能)
+- LANE_LINE_GUIDE.md (车道线功能)
+- QUICK_EDIT_GUIDE.md (快速编辑指南)
+
+✨ 现在可以放心使用了！
