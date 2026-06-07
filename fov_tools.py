@@ -291,6 +291,9 @@ class SensorConfig:
     disp_hfov:    float = 0.0          # displayed FOV arc degrees; 0 = same as hfov
     clip_by_vehicle: bool = True       # clip FOV by vehicle occlusion (new)
     clip_range:   float = 0.0          # manual clip distance; 0=auto compute (new)
+    use_manual_angles: bool = False    # use manual start/end angles as offsets from mount_angle
+    start_angle:  float = -45.0        # manual FOV start angle: offset from mount_angle (degrees)
+    end_angle:    float = 45.0         # manual FOV end angle: offset from mount_angle (degrees)
 
     def to_dict(self):
         return asdict(self)
@@ -457,13 +460,29 @@ def fov_path(sensor: SensorConfig, n_pts: int = 60) -> QPainterPath:
     if sensor.hfov <= 0 or sensor.range <= 0:
         return QPainterPath()
 
-    vis = getattr(sensor, 'disp_hfov', 0.0) or sensor.hfov
-    h2 = vis / 2.0
-    angles_rad = np.linspace(
-        math.radians(sensor.mount_angle - h2),
-        math.radians(sensor.mount_angle + h2),
-        max(n_pts, int(vis)),
-    )
+    # Check if manual angle mode is enabled
+    use_manual = getattr(sensor, 'use_manual_angles', False)
+    
+    if use_manual:
+        # Use manual angle offsets relative to mount_angle
+        start_offset = getattr(sensor, 'start_angle', -45.0)
+        end_offset = getattr(sensor, 'end_angle', 45.0)
+        start_deg = sensor.mount_angle + start_offset
+        end_deg = sensor.mount_angle + end_offset
+        angles_rad = np.linspace(
+            math.radians(start_deg),
+            math.radians(end_deg),
+            max(n_pts, int(abs(end_deg - start_deg))),
+        )
+    else:
+        # Use automatic angle range based on mount_angle and hfov
+        vis = getattr(sensor, 'disp_hfov', 0.0) or sensor.hfov
+        h2 = vis / 2.0
+        angles_rad = np.linspace(
+            math.radians(sensor.mount_angle - h2),
+            math.radians(sensor.mount_angle + h2),
+            max(n_pts, int(vis)),
+        )
 
     # Arc points in world offsets from sensor origin
     ax = sensor.range * np.sin(angles_rad)   # world X (right)
@@ -485,17 +504,43 @@ def fov_cone_faces(sensor: SensorConfig, n_az: int = 24, n_el: int = 6):
     if sensor.hfov <= 0 or sensor.range <= 0:
         return []
 
-    az0 = math.radians(sensor.mount_angle)
-    h2  = math.radians(sensor.hfov / 2)
+    # Check if manual angle mode is enabled
+    use_manual = getattr(sensor, 'use_manual_angles', False)
+    
+    if use_manual:
+        # Use manual angle offsets relative to mount_angle
+        start_offset = getattr(sensor, 'start_angle', -45.0)
+        end_offset = getattr(sensor, 'end_angle', 45.0)
+        start_deg = sensor.mount_angle + start_offset
+        end_deg = sensor.mount_angle + end_offset
+        az_start = math.radians(start_deg)
+        az_end = math.radians(end_deg)
+    else:
+        # Use automatic angle range based on mount_angle and hfov
+        az0 = math.radians(sensor.mount_angle)
+        h2  = math.radians(sensor.hfov / 2)
+        az_start = az0 - h2
+        az_end = az0 + h2
+    
     v2  = math.radians(sensor.vfov / 2)
-
     el0 = math.radians(getattr(sensor, 'pitch', 0.0))
     roll0 = math.radians(getattr(sensor, 'roll', 0.0))
-    azs = np.linspace(az0 - h2, az0 + h2, n_az)
+    azs = np.linspace(az_start, az_end, n_az)
     els = np.linspace(el0 - v2, el0 + v2, n_el)
     tip = np.array([sensor.x, sensor.y, sensor.z])
 
+    # Compute optical axis from angle range
+    az0 = (az_start + az_end) / 2.0
+    
     # If roll is non-zero, calculate optical axis vector for Rodrigues' rotation formula
+    if roll0 != 0:
+        ux = math.sin(az0) * math.cos(el0)
+        uy = math.cos(az0) * math.cos(el0)
+        uz = math.sin(el0)
+        u = np.array([ux, uy, uz])
+        cos_r = math.cos(roll0)
+        sin_r = math.sin(roll0)
+    
     if roll0 != 0:
         ux = math.sin(az0) * math.cos(el0)
         uy = math.cos(az0) * math.cos(el0)
@@ -2424,9 +2469,12 @@ class SensorPropertiesPanel(QWidget):
         self._rng  = spin(  1, 800, 0, " m")
         self._opa  = spin(  0,   1, 2, "")
         self._dhfov= spin(  0, 360, 1, "°")  # disp_hfov
+        self._start_angle = spin(-360, 360, 1, "°")  # manual FOV start angle
+        self._end_angle   = spin(-360, 360, 1, "°")  # manual FOV end angle
 
         for w in (self._x, self._y, self._z, self._ang, self._pitch, self._roll,
-                  self._hfov, self._vfov, self._rng, self._opa, self._dhfov):
+                  self._hfov, self._vfov, self._rng, self._opa, self._dhfov,
+                  self._start_angle, self._end_angle):
             w.valueChanged.connect(self._on_spinbox)
 
         self._color_btn = QPushButton()
@@ -2442,6 +2490,9 @@ class SensorPropertiesPanel(QWidget):
         
         self._clip_range = spin(0, 200, 1, " m")
         self._clip_range.valueChanged.connect(self._on_clip_changed)
+
+        self._use_manual_angles = QCheckBox("使用手动FOV角度")
+        self._use_manual_angles.stateChanged.connect(self._on_manual_angles_toggled)
 
         form.addRow("名称:",     self._name)
         form.addRow("类型:",     self._type)
@@ -2460,6 +2511,9 @@ class SensorPropertiesPanel(QWidget):
         form.addRow("",          self._enabled)
         form.addRow("",          self._clip_by_vehicle)
         form.addRow("手动切割距离:", self._clip_range)
+        form.addRow("",          self._use_manual_angles)
+        form.addRow("FOV起点偏移(°):", self._start_angle)  # Offset from mount_angle
+        form.addRow("FOV终点偏移(°):", self._end_angle)    # Offset from mount_angle
 
         layout.addLayout(form)
         layout.addStretch()
@@ -2505,6 +2559,9 @@ class SensorPropertiesPanel(QWidget):
         self._rng.setValue(sensor.range)
         self._opa.setValue(sensor.opacity)
         self._dhfov.setValue(getattr(sensor, 'disp_hfov', 0.0))
+        self._use_manual_angles.setChecked(getattr(sensor, 'use_manual_angles', False))
+        self._start_angle.setValue(getattr(sensor, 'start_angle', 0.0))
+        self._end_angle.setValue(getattr(sensor, 'end_angle', 0.0))
         self._enabled.setChecked(sensor.enabled)
         self._clip_by_vehicle.setChecked(getattr(sensor, 'clip_by_vehicle', True))
         self._clip_range.setValue(getattr(sensor, 'clip_range', 0.0))
@@ -2512,6 +2569,7 @@ class SensorPropertiesPanel(QWidget):
 
         self._updating = False
         self._set_editable(True)
+        self._update_manual_angle_ui()
         self._update_cov_label()
 
     def _clear(self):
@@ -2524,7 +2582,8 @@ class SensorPropertiesPanel(QWidget):
         for w in (self._name, self._type, self._x, self._y, self._z,
                   self._ang, self._pitch, self._roll, self._hfov, self._vfov, self._rng,
                   self._opa, self._dhfov, self._color_btn, self._enabled,
-                  self._clip_by_vehicle, self._clip_range):
+                  self._clip_by_vehicle, self._clip_range, self._use_manual_angles,
+                  self._start_angle, self._end_angle):
             w.setEnabled(on)
 
     def _on_moved(self, sensor_id: str):
@@ -2561,6 +2620,8 @@ class SensorPropertiesPanel(QWidget):
         self._sensor.range       = self._rng.value()
         self._sensor.opacity     = self._opa.value()
         self._sensor.disp_hfov  = self._dhfov.value()
+        self._sensor.start_angle = self._start_angle.value()
+        self._sensor.end_angle   = self._end_angle.value()
         self.signals.sensor_changed.emit(self._sensor.id)
         self._update_cov_label()
 
@@ -2583,6 +2644,18 @@ class SensorPropertiesPanel(QWidget):
             self._sensor.clip_by_vehicle = self._clip_by_vehicle.isChecked()
             self._sensor.clip_range = self._clip_range.value()
             self.signals.sensor_changed.emit(self._sensor.id)
+
+    def _on_manual_angles_toggled(self):
+        if self._sensor and not self._updating:
+            self._sensor.use_manual_angles = self._use_manual_angles.isChecked()
+            self.signals.sensor_changed.emit(self._sensor.id)
+            self._update_manual_angle_ui()
+
+    def _update_manual_angle_ui(self):
+        """Enable/disable manual angle fields based on checkbox state."""
+        enabled = self._use_manual_angles.isChecked()
+        self._start_angle.setEnabled(enabled)
+        self._end_angle.setEnabled(enabled)
 
     def _update_color_btn(self, hex_color: str):
         self._color_btn.setStyleSheet(

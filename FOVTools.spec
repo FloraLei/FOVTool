@@ -44,14 +44,14 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='FOV_Tools',  # 输出文件名: FOV_Tools.exe
+    name='FOV_Tools',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,  # 无控制台窗口（GUI模式）
+    console=False,
     disable_windowed_traceback=False,
     target_arch=None,
     codesign_identity=None,
